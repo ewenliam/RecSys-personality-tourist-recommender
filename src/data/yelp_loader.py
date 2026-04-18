@@ -175,7 +175,7 @@ class YelpDataLoader:
         Returns:
             DataFrame with photo metadata.
         """
-        photo_json = self.config.photos_path.parent / "photos.json"
+        photo_json = self.config.photos_path / "photos.json"
         if not photo_json.exists():
             logger.warning(f"Photo metadata not found: {photo_json}")
             return pd.DataFrame()

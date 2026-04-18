@@ -58,6 +58,27 @@ def main(args):
         user_ids = id_mappings["user_ids"]
         venue_ids = id_mappings["venue_ids"]
         logger.info(f"Loaded GNN embeddings: users {user_embeddings.shape}, venues {venue_embeddings.shape}")
+        logger.info(f"ID mappings: {len(user_ids)} users, {len(venue_ids)} venues")
+
+        # Reconcile: ID list MUST match embedding rows.
+        # They can diverge if embeddings and id_mappings were saved by different runs.
+        if len(user_ids) != user_embeddings.shape[0]:
+            n = min(len(user_ids), user_embeddings.shape[0])
+            logger.warning(
+                f"user_ids ({len(user_ids)}) != user_embeddings "
+                f"({user_embeddings.shape[0]}), truncating to {n}"
+            )
+            user_ids = user_ids[:n]
+            user_embeddings = user_embeddings[:n]
+
+        if len(venue_ids) != venue_embeddings.shape[0]:
+            n = min(len(venue_ids), venue_embeddings.shape[0])
+            logger.warning(
+                f"venue_ids ({len(venue_ids)}) != venue_embeddings "
+                f"({venue_embeddings.shape[0]}), truncating to {n}"
+            )
+            venue_ids = venue_ids[:n]
+            venue_embeddings = venue_embeddings[:n]
     else:
         logger.warning("GNN embeddings not found, using random initialization")
         user_ids = train_reviews["user_id"].unique().tolist()
@@ -65,9 +86,13 @@ def main(args):
         user_embeddings = np.random.randn(len(user_ids), 64).astype(np.float32) * 0.1
         venue_embeddings = np.random.randn(len(venue_ids), 64).astype(np.float32) * 0.1
 
-    # Create ID mappings
+    # Create ID mappings (indices are now guaranteed to be < embedding rows)
     user_id_map = {uid: idx for idx, uid in enumerate(user_ids)}
     venue_id_map = {vid: idx for idx, vid in enumerate(venue_ids)}
+    logger.info(
+        f"ID maps: {len(user_id_map)} users, {len(venue_id_map)} venues, "
+        f"embeddings: users {user_embeddings.shape}, venues {venue_embeddings.shape}"
+    )
 
     # Mine user patterns with DCI Closed
     logger.info("Mining user patterns with DCI Closed...")
@@ -82,30 +107,29 @@ def main(args):
     logger.info(f"Mined patterns for {len(user_profiles_df)} users")
     logger.info(f"Found {len(miner.dci.closed_itemsets)} closed itemsets")
 
-    # Create user extra features from itemset patterns
+    # Create user extra features from itemset patterns (vectorized)
     itemset_cols = [f"itemset_{i}" for i in range(args.itemset_features)]
     user_extra = np.zeros((len(user_ids), args.itemset_features), dtype=np.float32)
 
-    for _, row in user_profiles_df.iterrows():
-        user_id = row["user_id"]
-        if user_id in user_id_map:
-            idx = user_id_map[user_id]
-            for i, col in enumerate(itemset_cols):
-                user_extra[idx, i] = row[col]
+    # Map profile user_ids to indices (vectorized, no iterrows)
+    profile_user_ids = user_profiles_df["user_id"].values
+    profile_indices = np.array([
+        user_id_map.get(uid, -1) for uid in profile_user_ids
+    ])
+    valid = profile_indices >= 0
+    if valid.any():
+        valid_indices = profile_indices[valid]
+        itemset_values = user_profiles_df[itemset_cols].values[valid]
+        user_extra[valid_indices] = itemset_values.astype(np.float32)
 
     logger.info(f"User extra features shape: {user_extra.shape}")
 
-    # Convert edges to indices
+    # Convert edges to indices (vectorized, not iterrows)
     def reviews_to_edges(reviews_df):
-        users = []
-        venues = []
-        for _, row in reviews_df.iterrows():
-            uid = row["user_id"]
-            vid = row["business_id"]
-            if uid in user_id_map and vid in venue_id_map:
-                users.append(user_id_map[uid])
-                venues.append(venue_id_map[vid])
-        return np.array([users, venues])
+        u_idx = np.array([user_id_map.get(uid, -1) for uid in reviews_df["user_id"].values])
+        v_idx = np.array([venue_id_map.get(vid, -1) for vid in reviews_df["business_id"].values])
+        valid = (u_idx >= 0) & (v_idx >= 0)
+        return np.array([u_idx[valid], v_idx[valid]])
 
     train_edges = reviews_to_edges(train_reviews)
     val_edges = reviews_to_edges(val_reviews)
@@ -241,14 +265,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--min-support",
         type=float,
-        default=0.01,
-        help="Minimum support for DCI Closed",
+        default=0.005,
+        help="Minimum support for DCI Closed (0.005 = 0.5%% of users, "
+             "~1178 users for 235K dataset)",
     )
     parser.add_argument(
         "--max-itemset-size",
         type=int,
-        default=5,
-        help="Maximum itemset size",
+        default=3,
+        help="Maximum itemset size (3 is practical for Yelp scale)",
     )
     parser.add_argument(
         "--itemset-features",

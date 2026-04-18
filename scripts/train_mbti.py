@@ -2,21 +2,38 @@
 """
 Train BERT MBTI Classifier.
 
+Loads the Kaggle MBTI dataset (mbti_1.csv), explodes posts, cleans text,
+splits into train/val/test, upsamples the training set only (robust
+methodology), and trains a MBTIMultiLabelClassifier (4 binary heads).
+
 Usage:
-    python scripts/train_mbti.py --epochs 10 --batch-size 16
+    python scripts/train_mbti.py --epochs 3 --batch-size 32
     python scripts/train_mbti.py --resume checkpoint_epoch_5.pt
 """
 import argparse
+import gc
 import logging
+import os
+import sys
 from pathlib import Path
 
+# Prevent CUDA memory fragmentation on Windows (must be set before torch import)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import numpy as np
 import pandas as pd
 import torch
+from sklearn.model_selection import train_test_split
+from sklearn.utils import resample
 
-from src.config import get_config, PROCESSED_DATA_DIR, CHECKPOINT_DIR
-from src.data.preprocessor import ReviewDataset
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.config import get_config
+from src.config.settings import PROCESSED_DATA_DIR, CHECKPOINT_DIR, DATA_DIR
+from src.data.preprocessor import ReviewDataset, TextPreprocessor
 from src.models.bert_mbti import (
-    MBTIClassifier,
+    MBTIMultiLabelClassifier,
     MBTITrainer,
     create_data_loaders,
 )
@@ -25,53 +42,107 @@ from src.utils.helpers import setup_logging, set_seed, get_device
 logger = logging.getLogger(__name__)
 
 
-def load_mbti_data(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_mbti_data() -> pd.DataFrame:
     """
-    Load training and validation data with MBTI labels.
+    Load the Kaggle MBTI dataset (mbti_1.csv).
 
-    Note: This assumes you have MBTI-labeled data. If not, you'll need
-    to either:
-    1. Use an external MBTI dataset (e.g., Kaggle MBTI dataset)
-    2. Generate pseudo-labels using a pre-trained MBTI classifier
-    3. Use unsupervised clustering to create personality groups
-
-    Args:
-        data_dir: Directory with processed data.
+    The CSV has columns: 'type' (MBTI type) and 'posts' (multiple posts
+    separated by '|||'). We explode posts into individual rows and clean
+    the text.
 
     Returns:
-        Tuple of (train_df, val_df).
+        DataFrame with 'mbti' and 'clean_text' columns.
     """
-    train_path = data_dir / "train_reviews.parquet"
-    val_path = data_dir / "val_reviews.parquet"
+    mbti_csv_path = DATA_DIR / "raw" / "mbti_1.csv"
 
-    if not train_path.exists():
+    if not mbti_csv_path.exists():
         raise FileNotFoundError(
-            f"Training data not found: {train_path}\n"
-            "Run 'python scripts/prepare_data.py' first."
+            f"MBTI dataset not found at {mbti_csv_path}\n"
+            "Download it from Kaggle: https://www.kaggle.com/datasnaek/mbti-type\n"
+            "Place mbti_1.csv in data/raw/"
         )
 
-    train_df = pd.read_parquet(train_path)
-    val_df = pd.read_parquet(val_path)
+    # dtype_backend="numpy_nullable" avoids pyarrow strings which
+    # cause a 6GB realloc during explode on the massive posts column.
+    mbti_df = pd.read_csv(
+        mbti_csv_path,
+        dtype_backend="numpy_nullable",
+    )
+    logger.info(f"Loaded {len(mbti_df)} MBTI-labeled users")
 
-    # Check for MBTI labels
-    if "mbti" not in train_df.columns:
-        logger.warning(
-            "MBTI labels not found in data. Using synthetic labels for demo. "
-            "For real training, provide MBTI-labeled data."
-        )
-        # Create synthetic labels for demonstration
-        import numpy as np
-        np.random.seed(42)
-        mbti_types = [
-            "INTJ", "INTP", "ENTJ", "ENTP",
-            "INFJ", "INFP", "ENFJ", "ENFP",
-            "ISTJ", "ISFJ", "ESTJ", "ESFJ",
-            "ISTP", "ISFP", "ESTP", "ESFP",
-        ]
-        train_df["mbti"] = np.random.choice(mbti_types, size=len(train_df))
-        val_df["mbti"] = np.random.choice(mbti_types, size=len(val_df))
+    # Explode posts: each user has multiple posts separated by '|||'
+    # Build rows in plain Python to avoid pyarrow memory explosion
+    rows = []
+    for _, row in mbti_df.iterrows():
+        mbti_type = str(row["type"])
+        posts = str(row["posts"]).split("|||")
+        for post in posts:
+            post = post.strip()
+            if post:
+                rows.append({"mbti": mbti_type, "text": post})
 
-    return train_df, val_df
+    mbti_exploded = pd.DataFrame(rows)
+
+    # Clean text
+    preprocessor = TextPreprocessor()
+    mbti_exploded = preprocessor.process_dataframe(mbti_exploded, text_column="text")
+
+    logger.info(f"After exploding posts: {len(mbti_exploded)} samples")
+    logger.info(f"MBTI distribution:\n{mbti_exploded['mbti'].value_counts()}")
+
+    return mbti_exploded
+
+
+def split_and_upsample(
+    df: pd.DataFrame,
+    test_size: float = 0.2,
+    val_ratio: float = 0.5,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Split first, then upsample the training set only (robust methodology).
+
+    This prevents data leakage - upsampled copies never appear in val/test.
+
+    Args:
+        df: Full dataset with 'mbti' column.
+        test_size: Fraction for temp (val+test) split.
+        val_ratio: Fraction of temp to use as validation.
+
+    Returns:
+        Tuple of (train_df, val_df, test_df).
+    """
+    # Step 1: Split FIRST
+    train_df, temp_df = train_test_split(
+        df, test_size=test_size, stratify=df["mbti"], random_state=42
+    )
+    val_df, test_df = train_test_split(
+        temp_df, test_size=val_ratio, stratify=temp_df["mbti"], random_state=42
+    )
+
+    logger.info(f"Before upsampling - Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+
+    # Step 2: Upsample ONLY the training set
+    majority_class_size = train_df["mbti"].value_counts().max()
+    upsampled_classes = []
+
+    for mbti_type in train_df["mbti"].unique():
+        class_df = train_df[train_df["mbti"] == mbti_type]
+        if len(class_df) < majority_class_size:
+            class_upsampled = resample(
+                class_df,
+                replace=True,
+                n_samples=majority_class_size,
+                random_state=42,
+            )
+            upsampled_classes.append(class_upsampled)
+        else:
+            upsampled_classes.append(class_df)
+
+    train_df = pd.concat(upsampled_classes).sample(frac=1, random_state=42).reset_index(drop=True)
+
+    logger.info(f"After upsampling - Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+
+    return train_df, val_df, test_df
 
 
 def main(args):
@@ -87,20 +158,17 @@ def main(args):
     if args.learning_rate:
         config.bert.learning_rate = args.learning_rate
 
-    # Set seed for reproducibility
     set_seed(config.data.random_seed)
-
-    # Get device
     device = get_device(args.device)
 
-    # Load data
-    logger.info("Loading data...")
-    train_df, val_df = load_mbti_data(PROCESSED_DATA_DIR)
+    # Load Kaggle MBTI data
+    logger.info("Loading MBTI data from mbti_1.csv...")
+    mbti_df = load_mbti_data()
 
-    logger.info(f"Train samples: {len(train_df)}")
-    logger.info(f"Val samples: {len(val_df)}")
+    # Split first, upsample train only
+    train_df, val_df, test_df = split_and_upsample(mbti_df)
 
-    # Check text column
+    # Determine text column
     text_col = "clean_text" if "clean_text" in train_df.columns else "text"
 
     # Create datasets
@@ -118,19 +186,21 @@ def main(args):
         config=config.bert,
     )
 
-    # Create data loaders
+    # Create data loaders (num_workers=0 for Windows compatibility)
     train_loader, val_loader = create_data_loaders(
         train_dataset,
         val_dataset,
         batch_size=config.bert.batch_size,
-        num_workers=args.num_workers,
+        num_workers=0,
     )
+
+    logger.info(f"Train batches: {len(train_loader)}")
+    logger.info(f"Val batches: {len(val_loader)}")
 
     # Create model
     logger.info("Creating model...")
-    model = MBTIClassifier(config=config.bert)
+    model = MBTIMultiLabelClassifier(config=config.bert)
 
-    # Log model info
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model parameters: {num_params:,}")
 
@@ -148,15 +218,15 @@ def main(args):
         checkpoint_path = CHECKPOINT_DIR / "bert_mbti" / args.resume
         trainer.load_checkpoint(checkpoint_path)
 
+    # Free any stale allocations before training
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # Train
     logger.info("Starting training...")
     history = trainer.train()
 
-    # Print classification report
-    logger.info("\nClassification Report:")
-    print(trainer.get_classification_report())
-
-    # Save final metrics
+    # Print results
     logger.info(f"\nBest validation loss: {history['best_val_loss']:.4f}")
     logger.info(f"Checkpoints saved to: {trainer.checkpoint_dir}")
 
@@ -165,40 +235,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train BERT MBTI classifier")
 
     parser.add_argument(
-        "--epochs",
-        type=int,
-        default=None,
+        "--epochs", type=int, default=None,
         help="Number of training epochs",
     )
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
+        "--batch-size", type=int, default=None,
         help="Training batch size",
     )
     parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=None,
+        "--learning-rate", type=float, default=None,
         help="Learning rate",
     )
     parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
+        "--device", type=str, default="cuda",
         choices=["cuda", "mps", "cpu"],
         help="Device to train on",
     )
     parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="Number of data loading workers",
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
+        "--resume", type=str, default=None,
         help="Checkpoint filename to resume from",
     )
 

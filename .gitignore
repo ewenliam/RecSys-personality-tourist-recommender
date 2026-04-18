@@ -22,12 +22,30 @@ data/processed/
 *.json
 !package.json
 
-# Model checkpoints (large)
+# Model checkpoints and large binary artifacts
 models/checkpoints/
 *.pt
 *.pth
 *.bin
 *.onnx
+*.npy
+*.pkl
+*.xgb
+
+# Large model directories (embeddings, topic models)
+models/bertopic/topic_embeddings.npy
+models/bertopic/venue_embeddings.npy
+models/bertopic/topic_barchart.html
+models/bertopic/topic_visualization.html
+models/bertopic_mbti/
+models/bertopic_v2/
+models/gnn/user_gnn_embeddings.npy
+models/gnn/venue_gnn_embeddings.npy
+models/gnn_hetero/
+
+# Misc artefacts
+NUL
+results/
 
 # Jupyter Notebook
 .ipynb_checkpoints/

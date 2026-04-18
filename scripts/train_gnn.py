@@ -7,20 +7,28 @@ Usage:
     python scripts/train_gnn.py --use-gbce --gbce-t 0.8
 """
 import argparse
+import gc
 import logging
+import os
 from pathlib import Path
+
+# Prevent CUDA memory fragmentation on Windows (must be set before torch import)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import pandas as pd
 import torch
 
-from src.config import get_config, PROCESSED_DATA_DIR, MODEL_DIR, CHECKPOINT_DIR
+from src.config import get_config
+from src.config.settings import PROCESSED_DATA_DIR, MODEL_DIR, CHECKPOINT_DIR
 from src.models.gnn import (
     HeteroGraphBuilder,
     LTGNN,
     GNNTrainer,
     TrainTestSplit,
     build_recommendation_graph,
+    AugmentedLTGNN,
+    build_user_user_edges,
 )
 from src.utils.helpers import setup_logging, set_seed, get_device
 
@@ -47,6 +55,36 @@ def load_embeddings(model_dir: Path) -> dict:
     else:
         logger.warning("Venue embeddings not found, will use random initialization")
 
+    return embeddings
+
+
+def _reconcile_embeddings(
+    embeddings: dict, key: str, n_nodes: int, default_dim: int
+) -> dict:
+    """Ensure embeddings[key] has exactly n_nodes rows.
+
+    Three cases:
+    - Missing: create random init with default_dim.
+    - Too few rows: pad with random init (preserves loaded dim).
+    - Too many rows: truncate (assumes row order matches node order).
+    """
+    if key not in embeddings:
+        logger.info(f"Creating random {key} embeddings ({n_nodes}, {default_dim})")
+        embeddings[key] = np.random.randn(
+            n_nodes, default_dim
+        ).astype(np.float32) * 0.1
+    else:
+        loaded = embeddings[key]
+        dim = loaded.shape[1]
+        if loaded.shape[0] < n_nodes:
+            pad = np.random.randn(
+                n_nodes - loaded.shape[0], dim
+            ).astype(np.float32) * 0.1
+            embeddings[key] = np.vstack([loaded, pad])
+            logger.info(f"Padded {key} embeddings: {loaded.shape[0]} -> {n_nodes}")
+        elif loaded.shape[0] > n_nodes:
+            embeddings[key] = loaded[:n_nodes]
+            logger.info(f"Truncated {key} embeddings: {loaded.shape[0]} -> {n_nodes}")
     return embeddings
 
 
@@ -95,18 +133,19 @@ def main(args):
     # Load embeddings
     embeddings = load_embeddings(MODEL_DIR)
 
-    # Create embeddings if not available
-    if "user" not in embeddings:
-        logger.info("Creating random user embeddings")
-        embeddings["user"] = np.random.randn(
-            len(user_profiles), args.embedding_dim
-        ).astype(np.float32) * 0.1
+    # Reconcile embeddings with actual node counts
+    n_users = len(user_profiles)
+    n_venues = len(venue_topics)
 
-    if "venue" not in embeddings:
-        logger.info("Creating random venue embeddings")
-        embeddings["venue"] = np.random.randn(
-            len(venue_topics), args.embedding_dim
-        ).astype(np.float32) * 0.1
+    embeddings = _reconcile_embeddings(
+        embeddings, "user", n_users, args.embedding_dim
+    )
+    embeddings = _reconcile_embeddings(
+        embeddings, "venue", n_venues, args.embedding_dim
+    )
+
+    logger.info(f"User embeddings: {embeddings['user'].shape}")
+    logger.info(f"Venue embeddings: {embeddings['venue'].shape}")
 
     # Build graph
     logger.info("Building graph...")
@@ -138,20 +177,22 @@ def main(args):
     # Get train/val edges
     train_edge_index = builder.edges[("user", "visits", "venue")].edge_index
 
-    # Create validation edges from val_reviews
-    val_user_idx = []
-    val_venue_idx = []
+    # Create validation edges from val_reviews (vectorized)
     user_node = builder.nodes["user"]
     venue_node = builder.nodes["venue"]
 
-    for _, row in val_reviews.iterrows():
-        user_idx = user_node.get_idx(row["user_id"])
-        venue_idx = venue_node.get_idx(row["business_id"])
-        if user_idx is not None and venue_idx is not None:
-            val_user_idx.append(user_idx)
-            val_venue_idx.append(venue_idx)
-
-    val_edge_index = torch.tensor([val_user_idx, val_venue_idx], dtype=torch.long)
+    val_user_idx = np.array([
+        user_node.id_to_idx.get(uid, -1)
+        for uid in val_reviews["user_id"].values
+    ])
+    val_venue_idx = np.array([
+        venue_node.id_to_idx.get(vid, -1)
+        for vid in val_reviews["business_id"].values
+    ])
+    valid = (val_user_idx >= 0) & (val_venue_idx >= 0)
+    val_edge_index = torch.tensor(
+        [val_user_idx[valid], val_venue_idx[valid]], dtype=torch.long
+    )
 
     logger.info(f"Train edges: {train_edge_index.size(1)}")
     logger.info(f"Val edges: {val_edge_index.size(1)}")
@@ -159,7 +200,7 @@ def main(args):
     # Create model
     logger.info("Creating LTGNN model...")
 
-    model = LTGNN(
+    base_model = LTGNN(
         user_input_dim=embeddings["user"].shape[1],
         venue_input_dim=embeddings["venue"].shape[1],
         hidden_dim=args.hidden_dim,
@@ -167,6 +208,20 @@ def main(args):
         num_iterations=args.num_iterations,
         dropout=args.dropout,
     )
+
+    # V2: Optionally augment with User-User edges for cold-start mitigation
+    if args.use_user_edges:
+        logger.info("Building User-User edges from MBTI similarity...")
+        model = AugmentedLTGNN.from_base(
+            base_model,
+            user_embeddings=embeddings["user"],
+            similarity_threshold=args.user_edge_threshold,
+            max_neighbors=args.user_edge_max_neighbors,
+            user_user_weight=args.user_edge_weight,
+        )
+        logger.info("Using AugmentedLTGNN with User-User edges")
+    else:
+        model = base_model
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model parameters: {num_params:,}")
@@ -194,20 +249,52 @@ def main(args):
         gbce_t=args.gbce_t,
     )
 
+    # Free stale allocations before training
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # Train
     logger.info("Starting training...")
     history = trainer.train()
 
-    # Get final embeddings
-    logger.info("Extracting final embeddings...")
+    # Get final embeddings (memory-safe: chunked projection, CPU output)
+    logger.info("Extracting final embeddings for ALL nodes...")
     user_emb, venue_emb = trainer.get_embeddings()
 
-    # Save embeddings
+    # Validate shapes BEFORE saving - this is the critical gate that
+    # prevents Phase 5 from crashing with truncated embeddings
+    n_users = user_features.size(0)
+    n_venues = venue_features.size(0)
+    assert user_emb.size(0) == n_users, (
+        f"FATAL: user embeddings have {user_emb.size(0)} rows, "
+        f"expected {n_users}"
+    )
+    assert venue_emb.size(0) == n_venues, (
+        f"FATAL: venue embeddings have {venue_emb.size(0)} rows, "
+        f"expected {n_venues}"
+    )
+
+    logger.info(
+        f"User embeddings:  {tuple(user_emb.shape)} "
+        f"(expected ({n_users}, {args.embedding_dim}))"
+    )
+    logger.info(
+        f"Venue embeddings: {tuple(venue_emb.shape)} "
+        f"(expected ({n_venues}, {args.embedding_dim}))"
+    )
+
+    # Save embeddings (already on CPU from get_embeddings)
     output_dir = MODEL_DIR / "gnn"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    np.save(output_dir / "user_gnn_embeddings.npy", user_emb.cpu().numpy())
-    np.save(output_dir / "venue_gnn_embeddings.npy", venue_emb.cpu().numpy())
+    np.save(output_dir / "user_gnn_embeddings.npy", user_emb.numpy())
+    np.save(output_dir / "venue_gnn_embeddings.npy", venue_emb.numpy())
+
+    # Also save to gnn_hetero/ so evaluate_hybrid.py can find them
+    hetero_dir = MODEL_DIR / "gnn_hetero"
+    hetero_dir.mkdir(parents=True, exist_ok=True)
+    np.save(hetero_dir / "user_embeddings.npy", user_emb.numpy())
+    np.save(hetero_dir / "venue_embeddings.npy", venue_emb.numpy())
 
     # Save graph
     builder.save(output_dir / "graph")
@@ -215,6 +302,7 @@ def main(args):
     logger.info(f"\nTraining complete!")
     logger.info(f"Best NDCG@10: {history['best_metric']:.4f}")
     logger.info(f"Embeddings saved to: {output_dir}")
+    logger.info(f"Also saved to: {hetero_dir} (for evaluate_hybrid.py)")
     logger.info(f"Checkpoints saved to: {trainer.checkpoint_dir}")
 
 
@@ -224,14 +312,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--epochs",
         type=int,
-        default=100,
-        help="Number of training epochs",
+        default=15,
+        help="Number of training epochs (GNNs converge fast)",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1024,
-        help="Training batch size",
+        default=4096,
+        help="Training batch size (larger = fewer full-graph passes)",
     )
     parser.add_argument(
         "--learning-rate",
@@ -254,8 +342,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-iterations",
         type=int,
-        default=10,
-        help="Fixed-point iterations",
+        default=5,
+        help="Fixed-point iterations (5 is sufficient, 10 is overkill)",
     )
     parser.add_argument(
         "--dropout",
@@ -287,6 +375,31 @@ if __name__ == "__main__":
         default="cuda",
         choices=["cuda", "mps", "cpu"],
         help="Device for training",
+    )
+    # V2: User-User edge augmentation for cold-start
+    parser.add_argument(
+        "--use-user-edges",
+        action="store_true",
+        default=False,
+        help="Add User-User edges from MBTI similarity (cold-start fix)",
+    )
+    parser.add_argument(
+        "--user-edge-threshold",
+        type=float,
+        default=0.8,
+        help="Cosine similarity threshold for User-User edges",
+    )
+    parser.add_argument(
+        "--user-edge-max-neighbors",
+        type=int,
+        default=10,
+        help="Max User-User neighbors per user",
+    )
+    parser.add_argument(
+        "--user-edge-weight",
+        type=float,
+        default=0.5,
+        help="Weight for User-User edges in adjacency matrix (0-1)",
     )
 
     args = parser.parse_args()

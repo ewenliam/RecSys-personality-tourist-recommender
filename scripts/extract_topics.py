@@ -13,7 +13,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-from src.config import get_config, PROCESSED_DATA_DIR, MODEL_DIR
+from src.config import get_config
+from src.config.settings import PROCESSED_DATA_DIR, MODEL_DIR
 from src.models.bertopic import (
     VenueTopicExtractor,
     MultimodalEmbedder,

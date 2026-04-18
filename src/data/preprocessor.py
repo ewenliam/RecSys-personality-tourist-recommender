@@ -51,6 +51,7 @@ class TextPreprocessor:
         """
         if not text or not isinstance(text, str):
             return ""
+        
 
         # Decode HTML entities
         text = html.unescape(text)
@@ -107,118 +108,65 @@ class TextPreprocessor:
 
         return df
 
+import torch
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer
 
 class ReviewDataset(Dataset):
-    """PyTorch Dataset for review data."""
+    def __init__(self, df, text_column, label_column, config):
+        # FIX: Store the dataframe as a list of dictionaries so 'self.data' exists
+        self.data = df.reset_index(drop=True).to_dict('records')
+        self.text_column = text_column
+        self.label_column = label_column
+        self.config = config
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
-    # MBTI type mapping
-    MBTI_TYPES = [
-        "INTJ", "INTP", "ENTJ", "ENTP",
-        "INFJ", "INFP", "ENFJ", "ENFP",
-        "ISTJ", "ISFJ", "ESTJ", "ESFJ",
-        "ISTP", "ISFP", "ESTP", "ESFP",
-    ]
-    MBTI_TO_IDX = {mbti: idx for idx, mbti in enumerate(MBTI_TYPES)}
-    IDX_TO_MBTI = {idx: mbti for idx, mbti in enumerate(MBTI_TYPES)}
+    @classmethod
+    def from_dataframe(cls, df, text_column, label_column, config):
+        """Standard method to initialize the dataset."""
+        return cls(df, text_column, label_column, config)
 
-    def __init__(
-        self,
-        texts: list[str],
-        labels: Optional[list[str]] = None,
-        tokenizer: Optional[AutoTokenizer] = None,
-        config: Optional[BERTConfig] = None,
-    ):
-        """
-        Initialize the dataset.
+    def __len__(self):
+        return len(self.data)
 
-        Args:
-            texts: List of review texts.
-            labels: List of MBTI labels (optional for inference).
-            tokenizer: HuggingFace tokenizer.
-            config: BERT configuration.
-        """
-        self.texts = texts
-        self.labels = labels
-        self.config = config or get_config().bert
+    def __getitem__(self, idx):
+        item = self.data[idx] # This line was failing before
+        text = str(item[self.text_column])
+        mbti_type = str(item[self.label_column]).upper()
 
-        # Initialize tokenizer
-        if tokenizer is None:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
-        else:
-            self.tokenizer = tokenizer
+        # Map 'INTJ' -> 4 separate binary labels
+        labels = {
+            "EI": 1 if mbti_type[0] == "I" else 0,
+            "SN": 1 if mbti_type[1] == "N" else 0,
+            "TF": 1 if mbti_type[2] == "F" else 0,
+            "JP": 1 if mbti_type[3] == "P" else 0
+        }
 
-    def __len__(self) -> int:
-        return len(self.texts)
-
-    def __getitem__(self, idx: int) -> dict:
-        """Get a single item."""
-        text = self.texts[idx]
-
-        # Tokenize
         encoding = self.tokenizer(
             text,
             max_length=self.config.max_length,
             padding="max_length",
             truncation=True,
-            return_tensors="pt",
+            return_tensors="pt"
         )
 
-        item = {
-            "input_ids": encoding["input_ids"].squeeze(0),
-            "attention_mask": encoding["attention_mask"].squeeze(0),
+        return {
+            "input_ids": encoding["input_ids"].flatten(),
+            "attention_mask": encoding["attention_mask"].flatten(),
+            # Return the 4 individual labels as tensors
+            **{k: torch.tensor(v, dtype=torch.long) for k, v in labels.items()}
         }
 
-        # Add label if available
-        if self.labels is not None:
-            label = self.labels[idx]
-            if isinstance(label, str):
-                label_idx = self.MBTI_TO_IDX.get(label.upper(), 0)
-            else:
-                label_idx = int(label)
-            item["labels"] = torch.tensor(label_idx, dtype=torch.long)
-
-        return item
-
-    @classmethod
-    def from_dataframe(
-        cls,
-        df: pd.DataFrame,
-        text_column: str = "clean_text",
-        label_column: Optional[str] = "mbti",
-        tokenizer: Optional[AutoTokenizer] = None,
-        config: Optional[BERTConfig] = None,
-    ) -> "ReviewDataset":
-        """
-        Create dataset from DataFrame.
-
-        Args:
-            df: DataFrame with text and optional labels.
-            text_column: Column name for text.
-            label_column: Column name for labels.
-            tokenizer: HuggingFace tokenizer.
-            config: BERT configuration.
-
-        Returns:
-            ReviewDataset instance.
-        """
-        texts = df[text_column].tolist()
-        labels = df[label_column].tolist() if label_column and label_column in df.columns else None
-        return cls(texts=texts, labels=labels, tokenizer=tokenizer, config=config)
-
-
 class DataCollator:
-    """Custom data collator for batching."""
-
-    def __call__(self, features: list[dict]) -> dict:
-        """Collate features into a batch."""
-        batch = {}
-
-        # Stack tensors
-        batch["input_ids"] = torch.stack([f["input_ids"] for f in features])
-        batch["attention_mask"] = torch.stack([f["attention_mask"] for f in features])
-
-        # Add labels if present
-        if "labels" in features[0]:
-            batch["labels"] = torch.stack([f["labels"] for f in features])
-
-        return batch
+    def __call__(self, batch):
+        """
+        Dynamically stacks all keys present in the batch samples.
+        This handles input_ids, attention_mask, and the 4 MBTI labels.
+        """
+        # Get all keys present in the first item of the batch
+        keys = batch[0].keys()
+        
+        return {
+            key: torch.stack([item[key] for item in batch])
+            for key in keys
+        }

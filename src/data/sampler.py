@@ -37,6 +37,10 @@ class DataSampler:
         """
         Split data into train, validation, and test sets.
 
+        Memory-safe: uses numpy index shuffling instead of sklearn's
+        train_test_split which triggers a pyarrow 4GB+ realloc on
+        large DataFrames.
+
         Args:
             df: DataFrame to split.
             stratify_column: Column to stratify by (for balanced splits).
@@ -44,28 +48,20 @@ class DataSampler:
         Returns:
             Tuple of (train_df, val_df, test_df).
         """
-        stratify = df[stratify_column] if stratify_column and stratify_column in df.columns else None
+        n = len(df)
+        rng = np.random.RandomState(self.config.random_seed)
+        indices = rng.permutation(n)
 
-        # First split: train+val vs test
-        train_val, test = train_test_split(
-            df,
-            test_size=self.config.test_split,
-            random_state=self.config.random_seed,
-            stratify=stratify,
-        )
+        n_test = int(n * self.config.test_split)
+        n_val = int(n * self.config.val_split)
 
-        # Update stratify for second split
-        if stratify is not None:
-            stratify = train_val[stratify_column]
+        test_idx = indices[:n_test]
+        val_idx = indices[n_test:n_test + n_val]
+        train_idx = indices[n_test + n_val:]
 
-        # Second split: train vs val
-        val_ratio = self.config.val_split / (self.config.train_split + self.config.val_split)
-        train, val = train_test_split(
-            train_val,
-            test_size=val_ratio,
-            random_state=self.config.random_seed,
-            stratify=stratify,
-        )
+        train = df.iloc[train_idx].reset_index(drop=True)
+        val = df.iloc[val_idx].reset_index(drop=True)
+        test = df.iloc[test_idx].reset_index(drop=True)
 
         logger.info(f"Split sizes - Train: {len(train)}, Val: {len(val)}, Test: {len(test)}")
         return train, val, test

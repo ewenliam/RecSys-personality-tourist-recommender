@@ -9,7 +9,8 @@ import logging
 from pathlib import Path
 
 from src.data import YelpDataLoader, TextPreprocessor, DataSampler
-from src.config import get_config, PROCESSED_DATA_DIR, RAW_DATA_DIR
+from src.config import get_config
+from src.config.settings import PROCESSED_DATA_DIR, RAW_DATA_DIR
 from src.utils.helpers import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -63,12 +64,17 @@ def main(args):
         output_column="clean_text",
     )
 
-    # Filter by activity
-    logger.info("Filtering by user/business activity...")
+    # Filter by activity (use CLI overrides if provided)
+    min_user = args.min_user_reviews or config.data.min_reviews_per_user
+    min_biz = args.min_business_reviews or config.data.min_reviews_per_business
+    logger.info(
+        f"Filtering by activity: min_user_reviews={min_user}, "
+        f"min_business_reviews={min_biz}"
+    )
     reviews = sampler.filter_by_activity(
         reviews,
-        min_user_reviews=config.data.min_reviews_per_user,
-        min_business_reviews=config.data.min_reviews_per_business,
+        min_user_reviews=min_user,
+        min_business_reviews=min_biz,
     )
 
     # Split data
@@ -112,6 +118,18 @@ if __name__ == "__main__":
         action="store_false",
         dest="filter_tourism",
         help="Do not filter by categories",
+    )
+    parser.add_argument(
+        "--min-user-reviews",
+        type=int,
+        default=None,
+        help="Override min reviews per user (default from config: 5)",
+    )
+    parser.add_argument(
+        "--min-business-reviews",
+        type=int,
+        default=None,
+        help="Override min reviews per business (default from config: 3)",
     )
 
     args = parser.parse_args()

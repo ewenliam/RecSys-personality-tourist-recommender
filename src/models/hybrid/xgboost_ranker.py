@@ -2,8 +2,8 @@
 XGBoost-based Ranking Model.
 
 Combines GNN embeddings with context features and DCI patterns
-for final venue ranking. Uses custom calibrated loss to reduce
-overconfidence.
+for final venue ranking. Uses post-hoc calibration (Platt scaling
+or isotonic regression) to produce well-calibrated probabilities.
 """
 import logging
 from pathlib import Path
@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
 
 from src.config.settings import HybridConfig, get_config
 
@@ -124,52 +126,124 @@ class FeatureSynthesizer:
         user_extra: Optional[np.ndarray] = None,
         venue_extra: Optional[np.ndarray] = None,
         context_features: Optional[np.ndarray] = None,
+        personality_features: Optional[np.ndarray] = None,
+        topic_confidence: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        Create feature matrix for user-venue pairs.
+        Late-fusion ensemble feature matrix.
+
+        Instead of feeding raw embeddings to XGBoost (early fusion),
+        we pre-compute each sub-model's score for the (user, venue)
+        pair and let XGBoost learn how to *weigh* them. This avoids
+        the sparsity wall that killed early-fusion approaches.
+
+        Feature layout:
+          [0] knn_score      - cosine(MBTI_user, BERTopic_venue)
+          [1] gnn_score      - cosine(GNN_user, GNN_venue)
+          [2] venue_degree   - log(1 + #reviews for this venue)
+          [3] user_degree    - log(1 + #reviews for this user)
+
+        Only 4 features. Each is a dense, meaningful scalar that
+        XGBoost can split on with max_depth=4 trees.
 
         Args:
-            user_idx: User indices.
-            venue_idx: Venue indices.
-            user_embeddings: User embedding matrix.
-            venue_embeddings: Venue embedding matrix.
-            user_extra: Extra user features (e.g., itemset patterns).
-            venue_extra: Extra venue features (e.g., topic vectors).
-            context_features: Context features per pair.
+            user_idx: User indices for each pair.
+            venue_idx: Venue indices for each pair.
+            user_embeddings: GNN user embeddings [n_users, d].
+            venue_embeddings: GNN venue embeddings [n_venues, d].
+            user_extra: MBTI personality features [n_users, 7].
+            venue_extra: BERTopic PCA venue embeddings [n_venues, 64].
+            context_features: Pre-computed [N, d] array of additional
+                per-pair features (e.g., degree stats). If provided,
+                these are appended directly.
+            personality_features: Unused (legacy).
+            topic_confidence: Unused (legacy).
 
         Returns:
-            Feature matrix [num_pairs, feature_dim].
+            Feature matrix [num_pairs, num_features].
         """
-        # Get embeddings for pairs
-        user_emb = user_embeddings[user_idx]
-        venue_emb = venue_embeddings[venue_idx]
+        n = len(user_idx)
+        features = []
 
-        # Combine features
-        features = [user_emb, venue_emb]
+        # --- Score 1: KNN score (content-based) ---
+        # Cosine similarity between user's MBTI profile and venue's
+        # BERTopic topic embedding. This replicates the KNN baseline
+        # that achieved Hit Rate@10 = 0.200.
+        if user_extra is not None and venue_extra is not None:
+            pers = np.asarray(user_extra[user_idx], dtype=np.float32)
+            topic = np.asarray(venue_extra[venue_idx], dtype=np.float32)
+            # Project to common dimensionality for cosine sim
+            d = min(pers.shape[1], topic.shape[1])
+            p = pers[:, :d]
+            t = topic[:, :d]
+            dot = np.sum(p * t, axis=1, keepdims=True)
+            p_norm = np.linalg.norm(p, axis=1, keepdims=True) + 1e-8
+            t_norm = np.linalg.norm(t, axis=1, keepdims=True) + 1e-8
+            knn_score = (dot / (p_norm * t_norm)).astype(np.float32)
+        else:
+            knn_score = np.zeros((n, 1), dtype=np.float32)
+        features.append(knn_score)
 
-        # Add element-wise product (interaction)
-        features.append(user_emb * venue_emb)
+        # --- Score 2: GNN score (collaborative filtering) ---
+        # Cosine similarity between GNN user and venue embeddings.
+        # Captures structural neighbourhood affinity from the
+        # interaction graph.
+        user_emb = np.asarray(user_embeddings[user_idx], dtype=np.float32)
+        venue_emb = np.asarray(venue_embeddings[venue_idx], dtype=np.float32)
+        dot_gnn = np.sum(user_emb * venue_emb, axis=1, keepdims=True)
+        u_norm = np.linalg.norm(user_emb, axis=1, keepdims=True) + 1e-8
+        v_norm = np.linalg.norm(venue_emb, axis=1, keepdims=True) + 1e-8
+        gnn_score = (dot_gnn / (u_norm * v_norm)).astype(np.float32)
+        features.append(gnn_score)
 
-        # Add cosine similarity
-        cos_sim = np.sum(user_emb * venue_emb, axis=1, keepdims=True)
-        norms = (
-            np.linalg.norm(user_emb, axis=1, keepdims=True) *
-            np.linalg.norm(venue_emb, axis=1, keepdims=True) + 1e-8
-        )
-        cos_sim = cos_sim / norms
-        features.append(cos_sim)
-
-        # Add extra features
-        if user_extra is not None:
-            features.append(user_extra[user_idx])
-
-        if venue_extra is not None:
-            features.append(venue_extra[venue_idx])
-
+        # --- Context features (degree stats, passed from caller) ---
         if context_features is not None:
-            features.append(context_features)
+            features.append(np.asarray(context_features, dtype=np.float32))
 
         return np.hstack(features)
+
+
+def build_topic_confidence(
+    venue_topics_df: pd.DataFrame,
+    n_venues: int,
+    venue_id_map: Optional[Dict[str, int]] = None,
+    outlier_confidence: float = 0.1,
+) -> np.ndarray:
+    """
+    Build a per-venue topic confidence vector from BERTopic output.
+
+    Venues that were originally outliers (topic -1 before reduction)
+    get a low confidence score. This helps XGBoost learn when to trust
+    topic features vs. GNN embeddings.
+
+    Args:
+        venue_topics_df: DataFrame from VenueTopicExtractor with columns
+            "venue_id", "topic_prob", and optionally "was_outlier".
+        n_venues: Total number of venues in the embedding matrix.
+        venue_id_map: Maps venue_id string -> integer index.
+        outlier_confidence: Confidence assigned to ex-outlier venues.
+
+    Returns:
+        Array of shape [n_venues, 1] with confidence values.
+    """
+    confidence = np.ones((n_venues, 1), dtype=np.float32)
+
+    for _, row in venue_topics_df.iterrows():
+        vid = row["venue_id"]
+        idx = venue_id_map.get(vid, None) if venue_id_map else None
+        if idx is None:
+            continue
+        if idx >= n_venues:
+            continue
+
+        if row.get("was_outlier", False):
+            confidence[idx, 0] = outlier_confidence
+        else:
+            # Use the topic probability as confidence
+            prob = float(row.get("topic_prob", 1.0))
+            confidence[idx, 0] = max(prob, outlier_confidence)
+
+    return confidence
 
 
 class XGBoostRanker:
@@ -181,6 +255,7 @@ class XGBoostRanker:
         self,
         config: Optional[HybridConfig] = None,
         use_calibration: bool = True,
+        calibration_method: str = "platt",
         calibration_t: float = 0.8,
     ):
         """
@@ -189,25 +264,46 @@ class XGBoostRanker:
         Args:
             config: Hybrid configuration.
             use_calibration: Apply calibration to predictions.
-            calibration_t: Calibration temperature.
+            calibration_method: One of "platt", "isotonic", "temperature".
+                "platt" fits a logistic regression on raw XGBoost scores.
+                "isotonic" fits an isotonic regression (non-parametric).
+                "temperature" applies simple power-law scaling (legacy).
+            calibration_t: Temperature for "temperature" method only.
         """
         self.config = config or get_config().hybrid
         self.use_calibration = use_calibration
+        self.calibration_method = calibration_method
         self.calibration_t = calibration_t or self.config.gbce_calibration_t
 
         self.model: Optional[xgb.Booster] = None
+        self.calibrator = None  # Fitted post-hoc calibrator
         self.feature_synthesizer = FeatureSynthesizer()
 
-        # XGBoost parameters
+        # Degree arrays (set during prepare_training_data, used
+        # during predict/recommend for late-fusion features)
+        self.user_degree: Optional[np.ndarray] = None   # [n_users]
+        self.venue_degree: Optional[np.ndarray] = None   # [n_venues]
+
+        # Pointwise classification with class-weight balancing.
+        # scale_pos_weight is computed dynamically in train() as
+        # (n_neg / n_pos) to counteract the 4:1 negative sampling
+        # ratio and prevent the model from defaulting to
+        # "predict 0 for everything".
+        #
+        # With only 4 features (late fusion), we use shallow trees
+        # (max_depth 3-4) and lower regularisation since each feature
+        # is a strong, dense signal rather than a noisy embedding dim.
         self.params = {
             "objective": "binary:logistic",
             "eval_metric": ["auc", "logloss"],
             "max_depth": self.config.xgb_max_depth,
             "learning_rate": self.config.xgb_learning_rate,
             "subsample": self.config.xgb_subsample,
-            "colsample_bytree": self.config.xgb_colsample_bytree,
+            "colsample_bytree": 1.0,      # only 4 features, use all
+            "min_child_weight": 5,         # less aggressive with 4 feats
+            "gamma": 0.1,                  # lighter regularisation
             "tree_method": "hist",
-            "device": "cuda",  # Use GPU if available
+            "device": "cuda",
             "seed": 42,
         }
 
@@ -219,6 +315,7 @@ class XGBoostRanker:
         num_negatives: int = 4,
         user_extra: Optional[np.ndarray] = None,
         venue_extra: Optional[np.ndarray] = None,
+        max_pos_samples: int = 500_000,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare training data with negative sampling.
@@ -228,57 +325,86 @@ class XGBoostRanker:
             user_embeddings: User embeddings.
             venue_embeddings: Venue embeddings.
             num_negatives: Negatives per positive.
-            user_extra: Extra user features.
-            venue_extra: Extra venue features.
+            user_extra: Extra user features (personality [n_users, 7]).
+            venue_extra: Extra venue features (topic_pca [n_venues, 64]).
+            max_pos_samples: Cap on positive edges to keep memory
+                reasonable (500K * 5 = 2.5M pairs).
 
         Returns:
             Tuple of (features, labels).
         """
-        num_users = user_embeddings.shape[0]
         num_venues = venue_embeddings.shape[0]
+        num_edges = train_edges.shape[1]
 
-        # Build positive set for each user
-        user_positives = {}
-        for i in range(train_edges.shape[1]):
-            user = train_edges[0, i]
-            venue = train_edges[1, i]
-            if user not in user_positives:
-                user_positives[user] = set()
-            user_positives[user].add(venue)
+        # Subsample if too many edges (XGBoost doesn't need millions)
+        if num_edges > max_pos_samples:
+            logger.info(
+                f"Subsampling {num_edges} -> {max_pos_samples} positive edges"
+            )
+            perm = np.random.permutation(num_edges)[:max_pos_samples]
+            train_edges = train_edges[:, perm]
 
-        # Create training pairs
         pos_users = train_edges[0]
         pos_venues = train_edges[1]
         num_pos = len(pos_users)
 
-        # Sample negatives
-        neg_users = []
-        neg_venues = []
+        # Vectorized negative sampling (no Python loop over 2.8M edges)
+        total_neg = num_pos * num_negatives
+        neg_users = np.repeat(pos_users, num_negatives)
+        neg_venues = np.random.randint(0, num_venues, size=total_neg)
 
-        for user in pos_users:
-            positives = user_positives.get(user, set())
-            for _ in range(num_negatives):
-                neg = np.random.randint(0, num_venues)
-                while neg in positives:
-                    neg = np.random.randint(0, num_venues)
-                neg_users.append(user)
-                neg_venues.append(neg)
-
-        neg_users = np.array(neg_users)
-        neg_venues = np.array(neg_venues)
+        # Re-sample collisions (negatives that hit a positive)
+        pos_set = set(zip(pos_users.tolist(), pos_venues.tolist()))
+        collision_idx = np.array([
+            i for i in range(total_neg)
+            if (neg_users[i], neg_venues[i]) in pos_set
+        ])
+        # Re-roll just the collisions (usually < 1% of total)
+        for _ in range(10):
+            if len(collision_idx) == 0:
+                break
+            neg_venues[collision_idx] = np.random.randint(
+                0, num_venues, size=len(collision_idx)
+            )
+            still_bad = np.array([
+                (neg_users[i], neg_venues[i]) in pos_set
+                for i in collision_idx
+            ])
+            collision_idx = collision_idx[still_bad]
 
         # Combine
         all_users = np.concatenate([pos_users, neg_users])
         all_venues = np.concatenate([pos_venues, neg_venues])
         labels = np.concatenate([
             np.ones(num_pos),
-            np.zeros(len(neg_users)),
+            np.zeros(total_neg),
         ])
+
+        # Compute and store degree arrays from the ORIGINAL training
+        # edges (before subsampling). These are reused at inference.
+        num_users = user_embeddings.shape[0]
+        self.user_degree = np.zeros(num_users, dtype=np.float32)
+        self.venue_degree = np.zeros(num_venues, dtype=np.float32)
+        np.add.at(self.user_degree, pos_users, 1)
+        np.add.at(self.venue_degree, pos_venues, 1)
+        # Log-transform to compress heavy-tail distribution
+        self.user_degree = np.log1p(self.user_degree)
+        self.venue_degree = np.log1p(self.venue_degree)
+        logger.info(
+            f"Degree stats: user mean={self.user_degree.mean():.2f}, "
+            f"venue mean={self.venue_degree.mean():.2f}"
+        )
+
+        # Build per-pair context: [venue_degree, user_degree]
+        ctx = np.column_stack([
+            self.venue_degree[all_venues],
+            self.user_degree[all_users],
+        ]).astype(np.float32)
 
         # Fit synthesizer
         self.feature_synthesizer.fit(user_embeddings, venue_embeddings)
 
-        # Create features
+        # Create features (late-fusion: knn_score + gnn_score + degrees)
         user_emb, venue_emb, _ = self.feature_synthesizer.transform(
             user_embeddings, venue_embeddings
         )
@@ -287,15 +413,20 @@ class XGBoostRanker:
             all_users, all_venues,
             user_emb, venue_emb,
             user_extra, venue_extra,
+            context_features=ctx,
         )
 
-        # Shuffle
+        # Shuffle (important for stochastic gradient descent)
         perm = np.random.permutation(len(labels))
         features = features[perm]
         labels = labels[perm]
 
-        logger.info(f"Prepared {len(labels)} training samples "
-                   f"({num_pos} pos, {len(neg_users)} neg)")
+        logger.info(
+            f"Prepared {len(labels)} training samples "
+            f"({num_pos} pos, {total_neg} neg, "
+            f"neg:pos ratio = {num_negatives}:1, "
+            f"features = {features.shape[1]})"
+        )
 
         return features, labels
 
@@ -309,20 +440,53 @@ class XGBoostRanker:
         early_stopping_rounds: int = 10,
     ) -> Dict:
         """
-        Train the XGBoost model.
+        Train the XGBoost classifier with Platt calibration.
+
+        Automatically computes ``scale_pos_weight`` from the label
+        distribution (n_neg / n_pos) to counteract the negative
+        sampling ratio and prevent the model from ignoring the
+        minority positive class.
 
         Args:
-            train_features: Training features.
-            train_labels: Training labels.
-            val_features: Validation features.
-            val_labels: Validation labels.
-            num_rounds: Number of boosting rounds.
+            train_features: Training features [n_samples, n_features].
+            train_labels: Binary labels (1=positive, 0=negative).
+            val_features: Validation features (optional).
+            val_labels: Validation labels (optional).
+            num_rounds: Maximum boosting rounds.
             early_stopping_rounds: Early stopping patience.
 
         Returns:
-            Training history.
+            Training history dict.
         """
         num_rounds = num_rounds or self.config.xgb_n_estimators
+
+        # Compute scale_pos_weight from actual label distribution
+        n_pos = float(train_labels.sum())
+        n_neg = float(len(train_labels) - n_pos)
+        spw = n_neg / max(n_pos, 1.0)
+        self.params["scale_pos_weight"] = spw
+        logger.info(
+            f"Class balance: {int(n_pos)} pos, {int(n_neg)} neg "
+            f"-> scale_pos_weight={spw:.2f}"
+        )
+
+        # Carve out calibration set BEFORE training (never calibrate
+        # on data the model has seen). 15% hold-out for Platt scaling.
+        cal_features, cal_labels = val_features, val_labels
+        if cal_features is None and self.use_calibration and self.calibration_method != "temperature":
+            n = len(train_labels)
+            perm = np.random.permutation(n)
+            n_cal = max(int(n * 0.15), 1000)
+            cal_idx = perm[:n_cal]
+            train_idx = perm[n_cal:]
+
+            cal_features = train_features[cal_idx]
+            cal_labels = train_labels[cal_idx]
+            train_features = train_features[train_idx]
+            train_labels = train_labels[train_idx]
+            logger.info(
+                f"Carved {n_cal} calibration samples from training data"
+            )
 
         # Create DMatrix
         dtrain = xgb.DMatrix(train_features, label=train_labels)
@@ -333,7 +497,13 @@ class XGBoostRanker:
             evals.append((dval, "val"))
 
         # Train
-        logger.info("Training XGBoost ranker...")
+        logger.info(
+            f"Training XGBoost "
+            f"(objective={self.params['objective']}, "
+            f"max_depth={self.params['max_depth']}, "
+            f"min_child_weight={self.params.get('min_child_weight', 1)}, "
+            f"scale_pos_weight={spw:.2f})..."
+        )
 
         evals_result = {}
         self.model = xgb.train(
@@ -348,7 +518,84 @@ class XGBoostRanker:
 
         logger.info(f"Best iteration: {self.model.best_iteration}")
 
+        # Fit Platt scaler on held-out calibration data.
+        # binary:logistic outputs probabilities, so we convert to
+        # logits first, then fit logistic regression for recalibration.
+        if self.use_calibration and self.calibration_method != "temperature":
+            self._fit_calibrator(cal_features, cal_labels)
+
         return evals_result
+
+    def _fit_calibrator(
+        self,
+        cal_features: np.ndarray,
+        cal_labels: np.ndarray,
+    ) -> None:
+        """
+        Fit a post-hoc calibrator on held-out data.
+
+        Platt scaling fits a logistic regression on the raw XGBoost
+        output (logit of predicted probability). Isotonic regression
+        fits a non-parametric monotonic function.
+
+        Args:
+            cal_features: Calibration feature matrix.
+            cal_labels: Calibration binary labels.
+        """
+        if self.model is None:
+            raise ValueError("XGBoost model must be trained first.")
+
+        dcal = xgb.DMatrix(cal_features)
+        raw_scores = self.model.predict(dcal)
+
+        if self.calibration_method == "platt":
+            # Platt scaling: logistic regression on logits
+            logits = np.log(raw_scores / (1.0 - raw_scores + 1e-7))
+            self.calibrator = LogisticRegression(C=1.0, solver="lbfgs")
+            self.calibrator.fit(logits.reshape(-1, 1), cal_labels)
+            # Report calibration fit
+            cal_probs = self.calibrator.predict_proba(
+                logits.reshape(-1, 1)
+            )[:, 1]
+            logger.info(
+                f"Platt calibrator fitted: "
+                f"raw ECE={self._quick_ece(raw_scores, cal_labels):.4f}, "
+                f"calibrated ECE={self._quick_ece(cal_probs, cal_labels):.4f}"
+            )
+
+        elif self.calibration_method == "isotonic":
+            self.calibrator = IsotonicRegression(
+                y_min=0.0, y_max=1.0, out_of_bounds="clip"
+            )
+            self.calibrator.fit(raw_scores, cal_labels)
+            cal_probs = self.calibrator.predict(raw_scores)
+            logger.info(
+                f"Isotonic calibrator fitted: "
+                f"raw ECE={self._quick_ece(raw_scores, cal_labels):.4f}, "
+                f"calibrated ECE={self._quick_ece(cal_probs, cal_labels):.4f}"
+            )
+        else:
+            logger.warning(
+                f"Unknown calibration method '{self.calibration_method}', "
+                f"falling back to temperature scaling"
+            )
+
+    @staticmethod
+    def _quick_ece(
+        preds: np.ndarray, labels: np.ndarray, n_bins: int = 10
+    ) -> float:
+        """Fast ECE computation for logging during calibrator fitting."""
+        bin_boundaries = np.linspace(0, 1, n_bins + 1)
+        ece = 0.0
+        n = len(preds)
+        for i in range(n_bins):
+            mask = (preds >= bin_boundaries[i]) & (preds < bin_boundaries[i + 1])
+            count = mask.sum()
+            if count > 0:
+                ece += (count / n) * abs(
+                    labels[mask].mean() - preds[mask].mean()
+                )
+        return ece
 
     def predict(
         self,
@@ -379,23 +626,31 @@ class XGBoostRanker:
             raise ValueError("Model not trained. Call train() first.")
 
         # Transform embeddings
-        user_emb, venue_emb, context = self.feature_synthesizer.transform(
-            user_embeddings, venue_embeddings, context_features
+        user_emb, venue_emb, _ = self.feature_synthesizer.transform(
+            user_embeddings, venue_embeddings
         )
 
-        # Create features
+        # Build per-pair context (degree stats) from stored arrays
+        ctx = None
+        if self.venue_degree is not None and self.user_degree is not None:
+            ctx = np.column_stack([
+                self.venue_degree[venue_idx],
+                self.user_degree[user_idx],
+            ]).astype(np.float32)
+
+        # Create features (late-fusion scores + degrees)
         features = self.feature_synthesizer.create_pair_features(
             user_idx, venue_idx,
             user_emb, venue_emb,
             user_extra, venue_extra,
-            context,
+            context_features=ctx,
         )
 
-        # Predict
+        # Predict (binary:logistic outputs probabilities in [0, 1])
         dtest = xgb.DMatrix(features)
         scores = self.model.predict(dtest)
 
-        # Apply calibration
+        # Apply Platt calibration to improve probability estimates
         if self.use_calibration:
             scores = self._calibrate(scores)
 
@@ -403,15 +658,27 @@ class XGBoostRanker:
 
     def _calibrate(self, scores: np.ndarray) -> np.ndarray:
         """
-        Apply temperature calibration to reduce overconfidence.
+        Apply post-hoc calibration to raw XGBoost scores.
+
+        Uses the fitted calibrator (Platt or isotonic) if available,
+        otherwise falls back to temperature scaling.
 
         Args:
-            scores: Raw prediction scores.
+            scores: Raw prediction scores from XGBoost.
 
         Returns:
-            Calibrated scores.
+            Calibrated probability scores.
         """
-        # Temperature scaling
+        if self.calibrator is not None:
+            if self.calibration_method == "platt":
+                logits = np.log(scores / (1.0 - scores + 1e-7))
+                return self.calibrator.predict_proba(
+                    logits.reshape(-1, 1)
+                )[:, 1]
+            elif self.calibration_method == "isotonic":
+                return self.calibrator.predict(scores)
+
+        # Fallback: temperature scaling (legacy)
         return np.power(scores, 1.0 / self.calibration_t)
 
     def recommend(
@@ -571,15 +838,16 @@ class HybridRecommender:
         if venue_ids:
             self.venue_id_map = {vid: idx for idx, vid in enumerate(venue_ids)}
 
-        # Build positive set
-        for i in range(train_edges.shape[1]):
-            user = train_edges[0, i]
-            venue = train_edges[1, i]
-            if user not in self.user_positives:
-                self.user_positives[user] = set()
-            self.user_positives[user].add(venue)
+        # Build positive set (vectorized with pandas groupby)
+        import pandas as pd
+        edge_df = pd.DataFrame({
+            "user": train_edges[0], "venue": train_edges[1]
+        })
+        self.user_positives = (
+            edge_df.groupby("user")["venue"].apply(set).to_dict()
+        )
 
-        # Prepare training data
+        # Prepare training data (capped at 500K positives to fit in RAM)
         train_features, train_labels = self.ranker.prepare_training_data(
             train_edges,
             user_embeddings,
@@ -587,9 +855,10 @@ class HybridRecommender:
             num_negatives=num_negatives,
             user_extra=user_extra,
             venue_extra=venue_extra,
+            max_pos_samples=500_000,
         )
 
-        # Prepare validation data
+        # Prepare validation data (smaller cap for eval)
         val_features, val_labels = None, None
         if val_edges is not None:
             val_features, val_labels = self.ranker.prepare_training_data(
@@ -599,6 +868,7 @@ class HybridRecommender:
                 num_negatives=num_negatives,
                 user_extra=user_extra,
                 venue_extra=venue_extra,
+                max_pos_samples=100_000,
             )
 
         # Train

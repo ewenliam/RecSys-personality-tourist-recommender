@@ -22,7 +22,7 @@ class DataConfig:
     business_path: Path = RAW_DATA_DIR / "yelp_academic_dataset_business.json"
     review_path: Path = RAW_DATA_DIR / "yelp_academic_dataset_review.json"
     user_path: Path = RAW_DATA_DIR / "yelp_academic_dataset_user.json"
-    photos_path: Path = RAW_DATA_DIR / "photos"
+    photos_path: Path = RAW_DATA_DIR / "photos.json"
 
     # Processing params
     max_review_length: int = 512
@@ -42,8 +42,9 @@ class DataConfig:
 class BERTConfig:
     """BERT MBTI classifier configuration."""
     model_name: str = "bert-base-uncased"
-    max_length: int = 512
-    batch_size: int = 16
+    max_length: int = 128
+    batch_size: int = 32         # Updated to match Table 6.3
+    optimizer: str = "AdamW"      # New: Explicitly state the optimizer
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
     num_epochs: int = 10
@@ -66,6 +67,12 @@ class BERTopicConfig:
     hdbscan_min_samples: int = 5
     kmeans_n_clusters: int = 50
     nr_topics: Optional[int] = None  # Auto-determine
+    # MBTI-informed embeddings (Phase 2)
+    use_mbti_embeddings: bool = False
+    mbti_checkpoint_path: Optional[str] = None
+    # Outlier reduction (reduces topic -1 assignment rate)
+    reduce_outliers: bool = True
+    outlier_confidence: float = 0.1  # Confidence for ex-outlier venues
 
 
 @dataclass
@@ -82,20 +89,24 @@ class GNNConfig:
     # LTGNN specific
     fixed_point_iterations: int = 10
     evr_sample_size: int = 20
+    # Heterogeneous GNN (Phase 3)
+    use_heterogeneous: bool = True
+    num_sage_layers: int = 2
 
 
 @dataclass
 class HybridConfig:
     """Hybrid recommendation engine configuration."""
-    # XGBoost params
-    xgb_max_depth: int = 6
+    # XGBoost params (late-fusion ensemble, only 4 features)
+    xgb_max_depth: int = 4
     xgb_learning_rate: float = 0.1
     xgb_n_estimators: int = 100
     xgb_subsample: float = 0.8
-    xgb_colsample_bytree: float = 0.8
+    xgb_colsample_bytree: float = 0.5
 
-    # gBCE calibration
-    gbce_calibration_t: float = 0.8
+    # Post-hoc calibration (replaces raw gBCE temperature scaling)
+    calibration_method: str = "platt"  # "platt", "isotonic", "temperature"
+    gbce_calibration_t: float = 0.8    # Only used if method="temperature"
 
     # DCI Closed
     min_support: float = 0.01

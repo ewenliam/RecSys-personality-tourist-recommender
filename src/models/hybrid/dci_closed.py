@@ -5,6 +5,9 @@ Mines frequent closed itemsets from user visit history to create
 compact behavioral patterns. A closed itemset is one where no
 superset has the same support.
 
+Optimized with inverted index for O(1) support counting instead
+of scanning all transactions per candidate.
+
 Reference:
     Lucchese et al. "DCI_Closed: A Fast and Memory Efficient Algorithm
     for Mining Frequent Closed Itemsets"
@@ -34,13 +37,15 @@ class DCIClosed:
     """
     DCI Closed algorithm for mining frequent closed itemsets.
 
-    Optimized for user-venue interaction patterns.
+    Uses an inverted index (item -> transaction bitset) for fast
+    support counting via set intersection instead of full scans.
     """
 
     def __init__(
         self,
-        min_support: float = 0.01,
-        max_itemset_size: int = 5,
+        min_support: float = 0.05,
+        max_itemset_size: int = 3,
+        max_itemsets: int = 5000,
         config: Optional[HybridConfig] = None,
     ):
         """
@@ -49,22 +54,27 @@ class DCIClosed:
         Args:
             min_support: Minimum support threshold (fraction of transactions).
             max_itemset_size: Maximum itemset size to mine.
+            max_itemsets: Stop mining after this many itemsets found.
             config: Hybrid configuration.
         """
         self.config = config or get_config().hybrid
-        self.min_support = min_support or self.config.min_support
-        self.max_itemset_size = max_itemset_size or self.config.max_itemset_size
+        self.min_support = min_support
+        self.max_itemset_size = max_itemset_size
+        self.max_itemsets = max_itemsets
 
         self.transactions: List[Set] = []
         self.closed_itemsets: List[ClosedItemset] = []
         self.item_counts: Dict = {}
+
+        # Inverted index: item -> set of transaction indices
+        self._item_tids: Dict = {}
 
     def fit(self, transactions: List[Set]) -> List[ClosedItemset]:
         """
         Mine closed itemsets from transactions.
 
         Args:
-            transactions: List of transaction sets (e.g., venues visited by each user).
+            transactions: List of transaction sets.
 
         Returns:
             List of closed itemsets.
@@ -75,29 +85,52 @@ class DCIClosed:
         if n_transactions == 0:
             return []
 
-        min_count = int(self.min_support * n_transactions)
+        min_count = max(1, int(self.min_support * n_transactions))
         logger.info(f"Mining closed itemsets from {n_transactions} transactions")
         logger.info(f"Min support: {self.min_support} ({min_count} transactions)")
 
-        # Count individual items
-        self.item_counts = defaultdict(int)
-        for trans in transactions:
+        # Build inverted index: item -> set of transaction IDs
+        self._item_tids = defaultdict(set)
+        for tid, trans in enumerate(transactions):
             for item in trans:
-                self.item_counts[item] += 1
+                self._item_tids[item].add(tid)
 
-        # Filter frequent items
+        # Filter to frequent items only
         frequent_items = {
-            item for item, count in self.item_counts.items()
-            if count >= min_count
+            item for item, tids in self._item_tids.items()
+            if len(tids) >= min_count
         }
+
+        # Prune inverted index to frequent items
+        self._item_tids = {
+            item: tids for item, tids in self._item_tids.items()
+            if item in frequent_items
+        }
+
         logger.info(f"Frequent items: {len(frequent_items)}")
+
+        if len(frequent_items) == 0:
+            logger.warning("No frequent items found. Try lowering min_support.")
+            return []
+
+        if len(frequent_items) > 10000:
+            logger.warning(
+                f"Too many frequent items ({len(frequent_items)}). "
+                f"Raising min_support is recommended."
+            )
+
+        # Sort by frequency (ascending) for better pruning
+        sorted_items = sorted(
+            frequent_items,
+            key=lambda x: len(self._item_tids[x]),
+        )
 
         # Mine closed itemsets using depth-first search
         self.closed_itemsets = []
         self._mine_closed(
             prefix=frozenset(),
-            items=sorted(frequent_items, key=lambda x: self.item_counts[x]),
-            transactions=transactions,
+            prefix_tids=set(range(n_transactions)),
+            items=sorted_items,
             min_count=min_count,
         )
 
@@ -107,35 +140,47 @@ class DCIClosed:
     def _mine_closed(
         self,
         prefix: frozenset,
+        prefix_tids: Set[int],
         items: List,
-        transactions: List[Set],
         min_count: int,
     ) -> None:
-        """Recursive mining of closed itemsets."""
+        """
+        Recursive mining of closed itemsets using TID-set intersection.
+
+        Instead of scanning all transactions for each candidate,
+        we intersect TID sets: O(min(|A|, |B|)) per candidate.
+        """
         if len(prefix) >= self.max_itemset_size:
             return
 
-        for i, item in enumerate(items):
-            # Create new itemset
-            new_prefix = prefix | {item}
+        if len(self.closed_itemsets) >= self.max_itemsets:
+            return
 
-            # Count support
-            count = sum(1 for trans in transactions if new_prefix <= trans)
+        n_transactions = len(self.transactions)
+
+        for i, item in enumerate(items):
+            if len(self.closed_itemsets) >= self.max_itemsets:
+                return
+
+            # TID-set intersection instead of full scan
+            new_tids = prefix_tids & self._item_tids[item]
+            count = len(new_tids)
 
             if count < min_count:
                 continue
 
-            # Check if closed (no immediate superset has same support)
+            new_prefix = prefix | {item}
+
+            # Check if closed: no remaining item has the same support
             is_closed = True
             for other_item in items[i + 1:]:
-                extended = new_prefix | {other_item}
-                extended_count = sum(1 for trans in transactions if extended <= trans)
-                if extended_count == count:
+                extended_tids = new_tids & self._item_tids[other_item]
+                if len(extended_tids) == count:
                     is_closed = False
                     break
 
             if is_closed:
-                support = count / len(transactions)
+                support = count / n_transactions if n_transactions > 0 else 0.0
                 self.closed_itemsets.append(ClosedItemset(
                     items=new_prefix,
                     support=support,
@@ -143,57 +188,45 @@ class DCIClosed:
                 ))
 
             # Recurse with remaining items
-            remaining_items = items[i + 1:]
-            if remaining_items:
-                # Filter transactions that contain new_prefix
-                filtered_trans = [t for t in transactions if new_prefix <= t]
-                if len(filtered_trans) >= min_count:
-                    self._mine_closed(
-                        prefix=new_prefix,
-                        items=remaining_items,
-                        transactions=filtered_trans,
-                        min_count=min_count,
-                    )
+            remaining = items[i + 1:]
+            if remaining and count >= min_count:
+                self._mine_closed(
+                    prefix=new_prefix,
+                    prefix_tids=new_tids,
+                    items=remaining,
+                    min_count=min_count,
+                )
 
     def get_user_patterns(
         self,
-        user_transactions: Dict[str, Set],
-    ) -> Dict[str, List[ClosedItemset]]:
+        user_venues: Set,
+    ) -> List[ClosedItemset]:
         """
-        Get closed itemset patterns for each user.
+        Get closed itemset patterns matching a single user's venues.
 
         Args:
-            user_transactions: Dict mapping user_id to their venue set.
+            user_venues: Set of venues the user has visited.
 
         Returns:
-            Dict mapping user_id to their matching closed itemsets.
+            List of matching closed itemsets, sorted by support.
         """
-        user_patterns = {}
-
-        for user_id, venues in user_transactions.items():
-            matching = []
-            for itemset in self.closed_itemsets:
-                if itemset.items <= venues:
-                    matching.append(itemset)
-
-            # Sort by support (descending)
-            matching.sort(key=lambda x: x.support, reverse=True)
-            user_patterns[user_id] = matching
-
-        return user_patterns
+        matching = [
+            itemset for itemset in self.closed_itemsets
+            if itemset.items <= user_venues
+        ]
+        matching.sort(key=lambda x: x.support, reverse=True)
+        return matching
 
     def itemset_to_features(
         self,
-        user_id: str,
-        user_transactions: Dict[str, Set],
+        user_venues: Set,
         top_k: int = 10,
     ) -> np.ndarray:
         """
         Convert user's itemset patterns to feature vector.
 
         Args:
-            user_id: User ID.
-            user_transactions: Dict mapping user_id to venue set.
+            user_venues: Set of venues the user visited.
             top_k: Number of top itemsets to use as features.
 
         Returns:
@@ -208,9 +241,7 @@ class DCIClosed:
             key=lambda x: (-x.support, -len(x.items)),
         )[:top_k]
 
-        user_venues = user_transactions.get(user_id, set())
         features = np.zeros(top_k)
-
         for i, itemset in enumerate(sorted_itemsets):
             if itemset.items <= user_venues:
                 features[i] = itemset.support
@@ -227,19 +258,14 @@ class UserProfileMiner:
 
     def __init__(
         self,
-        min_support: float = 0.01,
-        max_itemset_size: int = 5,
+        min_support: float = 0.05,
+        max_itemset_size: int = 3,
+        max_itemsets: int = 5000,
     ):
-        """
-        Initialize the miner.
-
-        Args:
-            min_support: Minimum support for closed itemsets.
-            max_itemset_size: Maximum itemset size.
-        """
         self.dci = DCIClosed(
             min_support=min_support,
             max_itemset_size=max_itemset_size,
+            max_itemsets=max_itemsets,
         )
         self.user_transactions: Dict[str, Set] = {}
         self.venue_categories: Dict[str, Set[str]] = {}
@@ -311,8 +337,7 @@ class UserProfileMiner:
 
         # Itemset pattern features
         itemset_feats = self.dci.itemset_to_features(
-            user_id,
-            self.user_transactions,
+            venues,
             top_k=itemset_features,
         )
         for i, feat in enumerate(itemset_feats):
@@ -331,9 +356,8 @@ class UserProfileMiner:
                 reverse=True,
             )[:5]
 
-        # Matching patterns
-        patterns = self.dci.get_user_patterns(self.user_transactions)
-        user_patterns = patterns.get(user_id, [])
+        # Matching patterns (for this user only, not all users)
+        user_patterns = self.dci.get_user_patterns(venues)
         profile["num_patterns"] = len(user_patterns)
         profile["top_pattern_support"] = (
             user_patterns[0].support if user_patterns else 0.0
@@ -354,32 +378,50 @@ class UserProfileMiner:
         Returns:
             DataFrame with user profiles.
         """
+        # Pre-sort itemsets once for consistent feature ordering
+        sorted_itemsets = sorted(
+            self.dci.closed_itemsets,
+            key=lambda x: (-x.support, -len(x.items)),
+        )[:itemset_features]
+
         profiles = []
-
-        for user_id in self.user_transactions.keys():
-            profile = self.get_user_profile(user_id, itemset_features)
-
-            # Flatten for DataFrame
-            flat_profile = {
-                "user_id": profile["user_id"],
-                "num_venues": profile["num_venues"],
-                "num_patterns": profile["num_patterns"],
-                "top_pattern_support": profile["top_pattern_support"],
+        for user_id, venues in self.user_transactions.items():
+            flat = {
+                "user_id": user_id,
+                "num_venues": len(venues),
             }
 
-            # Add itemset features
-            for i in range(itemset_features):
-                flat_profile[f"itemset_{i}"] = profile.get(f"itemset_{i}", 0.0)
+            # Vectorized itemset features (no per-user full pattern search)
+            for i, itemset in enumerate(sorted_itemsets):
+                flat[f"itemset_{i}"] = (
+                    itemset.support if itemset.items <= venues else 0.0
+                )
 
-            profiles.append(flat_profile)
+            # Pad remaining features with zeros
+            for i in range(len(sorted_itemsets), itemset_features):
+                flat[f"itemset_{i}"] = 0.0
+
+            # Pattern count
+            n_patterns = sum(
+                1 for itemset in self.dci.closed_itemsets
+                if itemset.items <= venues
+            )
+            flat["num_patterns"] = n_patterns
+            flat["top_pattern_support"] = (
+                sorted_itemsets[0].support
+                if sorted_itemsets and sorted_itemsets[0].items <= venues
+                else 0.0
+            )
+
+            profiles.append(flat)
 
         return pd.DataFrame(profiles)
 
 
 def mine_user_patterns(
     interactions_df: pd.DataFrame,
-    min_support: float = 0.01,
-    max_itemset_size: int = 5,
+    min_support: float = 0.05,
+    max_itemset_size: int = 3,
     user_col: str = "user_id",
     venue_col: str = "business_id",
 ) -> Tuple[UserProfileMiner, pd.DataFrame]:

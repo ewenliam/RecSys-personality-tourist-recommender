@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Optional, Union
 from dataclasses import dataclass
-
+from sklearn.feature_extraction.text import CountVectorizer
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -35,6 +35,8 @@ class VenueTopicExtractor:
         self,
         config: Optional[BERTopicConfig] = None,
         use_multimodal: bool = False,
+        use_mbti_embeddings: bool = False,
+        mbti_checkpoint_path: Optional[Path] = None,
         device: Optional[str] = None,
     ):
         """
@@ -43,12 +45,17 @@ class VenueTopicExtractor:
         Args:
             config: BERTopic configuration.
             use_multimodal: Whether to use multimodal embeddings.
+            use_mbti_embeddings: Use BERT-MBTI model for embeddings
+                instead of generic sentence-transformers.
+            mbti_checkpoint_path: Path to trained MBTI model checkpoint.
             device: Device for inference.
         """
         import torch
 
         self.config = config or get_config().bertopic
         self.use_multimodal = use_multimodal
+        self.use_mbti_embeddings = use_mbti_embeddings
+        self.mbti_checkpoint_path = mbti_checkpoint_path
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self.topic_model = None
@@ -58,7 +65,9 @@ class VenueTopicExtractor:
 
     def _create_embedding_model(self):
         """Create the embedding model."""
-        if self.use_multimodal:
+        if self.use_mbti_embeddings:
+            return self._create_mbti_embedding_model()
+        elif self.use_multimodal:
             from .multimodal import MultimodalEmbedder
             return MultimodalEmbedder(
                 text_model=self.config.embedding_model,
@@ -72,16 +81,25 @@ class VenueTopicExtractor:
                 device=self.device,
             )
 
-    def _create_umap_model(self):
-        """Create UMAP dimensionality reduction model."""
-        from umap import UMAP
+    def _create_mbti_embedding_model(self):
+        """Create BERT-MBTI embedding model for personality-informed topics."""
+        from .mbti_embedder import MBTIEmbedder
 
+        return MBTIEmbedder(
+            model_path=self.mbti_checkpoint_path,
+            device=self.device,
+        )
+
+    def _create_umap_model(self):
+        """Create a more stable UMAP model."""
+        from umap import UMAP
         return UMAP(
-            n_neighbors=self.config.umap_n_neighbors,
-            n_components=self.config.umap_n_components,
-            min_dist=self.config.umap_min_dist,
-            metric=self.config.umap_metric,
+            n_neighbors=15,
+            n_components=5,
+            metric='cosine',
+            low_memory=True, # Saves RAM to prevent kernel death
             random_state=42,
+            transform_queue_size=4.0 # Helps with Windows threading
         )
 
     def _create_hdbscan_model(self):
@@ -106,14 +124,12 @@ class VenueTopicExtractor:
         )
 
     def _create_vectorizer_model(self):
-        """Create vectorizer for c-TF-IDF."""
+        """Limit vocabulary to prevent the '500-minute' CPU hang."""
         from sklearn.feature_extraction.text import CountVectorizer
-
         return CountVectorizer(
             stop_words="english",
-            ngram_range=(1, 2),
-            min_df=5,
-            max_df=0.95,
+            min_df=10, 
+            max_features=5000 # Further reduced to ensure it finishes
         )
 
     def _create_ctfidf_model(self):
@@ -133,23 +149,23 @@ class VenueTopicExtractor:
         ]
 
     def build_model(self, use_kmeans: bool = False):
-        """
-        Build the BERTopic model with all components.
-
-        Args:
-            use_kmeans: Use K-Means instead of HDBSCAN for clustering.
-        """
+        """Build the BERTopic model with an explicit embedding model."""
         from bertopic import BERTopic
+        
+        # 1. Create the embedding model explicitly
+        # This gives KeyBERTInspired the 'engine' it needs to embed words
+        embedding_model = self._create_embedding_model()
 
-        # Create components
+        # 2. Create your other components
         umap_model = self._create_umap_model()
         cluster_model = self._create_kmeans_model() if use_kmeans else self._create_hdbscan_model()
         vectorizer_model = self._create_vectorizer_model()
         ctfidf_model = self._create_ctfidf_model()
         representation_model = self._create_representation_model()
 
-        # Build BERTopic
+        # 3. Initialize BERTopic with the embedding_model passed in
         self.topic_model = BERTopic(
+            embedding_model=embedding_model,  # THIS IS THE FIX
             umap_model=umap_model,
             hdbscan_model=cluster_model,
             vectorizer_model=vectorizer_model,
@@ -159,19 +175,172 @@ class VenueTopicExtractor:
             verbose=True,
         )
 
-        logger.info("BERTopic model built successfully")
+        logger.info("BERTopic model built with explicit embedding engine.")
+
+    def find_sweet_spot(
+        self,
+        documents: list[str],
+        embeddings: np.ndarray,
+        target_outlier_pct: float = 10.0,
+        candidates: Optional[list[int]] = None,
+    ) -> int:
+        """
+        Grid search over HDBSCAN min_cluster_size to hit target outlier rate.
+
+        Runs UMAP once, then fits HDBSCAN for each candidate. Picks the
+        min_cluster_size closest to target_outlier_pct, preferring the
+        5-15% band.
+
+        Args:
+            documents: Pre-built venue documents.
+            embeddings: Pre-computed document embeddings.
+            target_outlier_pct: Desired outlier percentage (default 10%).
+            candidates: List of min_cluster_size values to try.
+
+        Returns:
+            Best min_cluster_size value.
+        """
+        from hdbscan import HDBSCAN
+        from umap import UMAP
+
+        if candidates is None:
+            candidates = [5, 8, 10, 15, 20, 30, 50]
+
+        logger.info(f"Searching for sweet spot (target: {target_outlier_pct}% outliers)")
+
+        # Shared UMAP reduction (expensive, do once)
+        umap_model = UMAP(
+            n_neighbors=self.config.umap_n_neighbors,
+            n_components=self.config.umap_n_components,
+            metric=self.config.umap_metric,
+            low_memory=True,
+            random_state=42,
+        )
+        reduced = umap_model.fit_transform(embeddings)
+
+        results = []
+        for mcs in candidates:
+            hdbscan_model = HDBSCAN(
+                min_cluster_size=mcs,
+                min_samples=max(1, mcs // 3),
+                metric="euclidean",
+                prediction_data=True,
+            )
+            labels = hdbscan_model.fit_predict(reduced)
+            n_outliers = (labels == -1).sum()
+            outlier_pct = 100.0 * n_outliers / len(labels)
+            n_topics = len(set(labels) - {-1})
+
+            results.append({
+                "min_cluster_size": mcs,
+                "outlier_pct": outlier_pct,
+                "n_topics": n_topics,
+            })
+            logger.info(
+                f"  min_cluster_size={mcs:3d}: "
+                f"{outlier_pct:5.1f}% outliers, {n_topics} topics"
+            )
+
+        # Pick closest to target, preferring 5-15% band
+        results_df = pd.DataFrame(results)
+        in_band = results_df[
+            (results_df["outlier_pct"] >= 5) & (results_df["outlier_pct"] <= 15)
+        ]
+
+        if len(in_band) > 0:
+            best_idx = (in_band["outlier_pct"] - target_outlier_pct).abs().idxmin()
+        else:
+            best_idx = (results_df["outlier_pct"] - target_outlier_pct).abs().idxmin()
+
+        best = results_df.loc[best_idx]
+        best_mcs = int(best["min_cluster_size"])
+
+        logger.info(
+            f"Selected min_cluster_size={best_mcs}: "
+            f"{best['outlier_pct']:.1f}% outliers, {int(best['n_topics'])} topics"
+        )
+
+        # Update config so subsequent build_model() uses the tuned value
+        self.config.hdbscan_min_cluster_size = best_mcs
+        return best_mcs
+
+    def get_topic_confidence(
+        self,
+        outlier_penalty: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Build per-document topic confidence from fitted model.
+
+        Venues with strong topic assignment get high confidence.
+        Ex-outlier venues (originally topic -1 before reduction) get
+        penalized so downstream models (XGBoost) learn to rely on
+        GNN embeddings rather than topic features for those venues.
+
+        Must be called AFTER fit() or fit_transform_venues().
+
+        Args:
+            outlier_penalty: Max confidence for ex-outlier venues.
+                Defaults to config.outlier_confidence.
+
+        Returns:
+            Confidence array [n_documents, 1].
+        """
+        if self.topics is None or self.probs is None:
+            raise ValueError("Model not fitted. Call fit() first.")
+
+        if outlier_penalty is None:
+            outlier_penalty = self.config.outlier_confidence
+
+        n = len(self.topics)
+        confidence = np.ones((n, 1), dtype=np.float32)
+
+        # Get the topic distribution matrix
+        if isinstance(self.probs, np.ndarray) and len(self.probs.shape) == 2:
+            topic_distr = self.probs
+        else:
+            topic_distr = None
+
+        # Track which docs were originally outliers
+        was_outlier = getattr(self, "_original_outlier_mask", None)
+
+        for i in range(n):
+            is_ex_outlier = was_outlier[i] if was_outlier is not None else False
+
+            if is_ex_outlier:
+                # Ex-outlier: use max topic probability, capped
+                if topic_distr is not None and topic_distr.shape[1] > 0:
+                    max_prob = float(topic_distr[i].max())
+                    confidence[i, 0] = min(max_prob, outlier_penalty)
+                else:
+                    confidence[i, 0] = outlier_penalty
+            else:
+                # Original topic: use the assigned topic's probability
+                t = self.topics[i]
+                if topic_distr is not None and 0 <= t < topic_distr.shape[1]:
+                    confidence[i, 0] = float(topic_distr[i, t])
+                else:
+                    confidence[i, 0] = 1.0
+
+        return confidence
 
     def fit(
         self,
         documents: list[str],
         embeddings: Optional[np.ndarray] = None,
+        reduce_outliers: bool = True,
     ) -> tuple[list[int], np.ndarray]:
         """
-        Fit the topic model on documents.
+        Fit the topic model on documents with optional outlier reduction.
+
+        When reduce_outliers=True (default), documents assigned to
+        topic -1 are reassigned to their closest topic using
+        BERTopic's built-in approximate_distribution strategy
+        followed by c-TF-IDF-based reassignment.
 
         Args:
             documents: List of document texts.
             embeddings: Optional pre-computed embeddings.
+            reduce_outliers: Whether to reassign outlier documents.
 
         Returns:
             Tuple of (topics, probabilities).
@@ -196,13 +365,120 @@ class VenueTopicExtractor:
         else:
             self.embeddings = embeddings
 
-        logger.info(f"Found {len(set(self.topics)) - 1} topics (excluding outliers)")
+        n_outliers_before = sum(1 for t in self.topics if t == -1)
+        n_total = len(self.topics)
+        logger.info(
+            f"Initial fit: {len(set(self.topics)) - 1} topics, "
+            f"{n_outliers_before}/{n_total} outliers "
+            f"({100 * n_outliers_before / n_total:.1f}%)"
+        )
+
+        # Outlier reduction: reassign -1 documents
+        if reduce_outliers and n_outliers_before > 0:
+            self.topics, self.probs = self._reduce_outliers(
+                documents, embeddings
+            )
+        else:
+            # No reduction - mark current outliers for get_topic_confidence()
+            self._original_outlier_mask = [t == -1 for t in self.topics]
+
+        return self.topics, self.probs
+
+    def _reduce_outliers(
+        self,
+        documents: list[str],
+        embeddings: Optional[np.ndarray] = None,
+    ) -> tuple[list[int], np.ndarray]:
+        """
+        Reassign outlier documents (topic -1) to their closest topic.
+
+        Uses a two-stage strategy:
+          1. Embedding-based: cosine similarity to topic centroids
+          2. c-TF-IDF-based: word distribution overlap with topics
+
+        Documents that remain outliers after both stages keep topic -1.
+
+        Args:
+            documents: Document texts.
+            embeddings: Pre-computed document embeddings.
+
+        Returns:
+            Updated (topics, probabilities).
+        """
+        topics = list(self.topics)
+        n_before = sum(1 for t in topics if t == -1)
+
+        # Store original outlier mask for get_topic_confidence()
+        self._original_outlier_mask = [t == -1 for t in topics]
+
+        # Stage 1: embedding-based reassignment
+        try:
+            new_topics = self.topic_model.reduce_outliers(
+                documents,
+                topics,
+                strategy="embeddings",
+                embeddings=embeddings,
+                threshold=0.0,  # Accept any positive similarity
+            )
+            n_after_emb = sum(1 for t in new_topics if t == -1)
+            logger.info(
+                f"Outlier reduction (embeddings): "
+                f"{n_before} -> {n_after_emb} outliers"
+            )
+            topics = new_topics
+        except Exception as e:
+            logger.warning(f"Embedding-based outlier reduction failed: {e}")
+
+        # Stage 2: c-TF-IDF-based reassignment for remaining outliers
+        n_still_outliers = sum(1 for t in topics if t == -1)
+        if n_still_outliers > 0:
+            try:
+                new_topics = self.topic_model.reduce_outliers(
+                    documents,
+                    topics,
+                    strategy="c-tf-idf",
+                    threshold=0.0,
+                )
+                n_after_ctfidf = sum(1 for t in new_topics if t == -1)
+                logger.info(
+                    f"Outlier reduction (c-TF-IDF): "
+                    f"{n_still_outliers} -> {n_after_ctfidf} outliers"
+                )
+                topics = new_topics
+            except Exception as e:
+                logger.warning(f"c-TF-IDF outlier reduction failed: {e}")
+
+        # Update topic model's internal state
+        self.topic_model.update_topics(documents, topics=topics)
+
+        # Recompute probabilities via approximate_distribution
+        try:
+            topic_distr, _ = self.topic_model.approximate_distribution(
+                documents, min_similarity=0.0
+            )
+            probs = topic_distr
+            logger.info("Recomputed topic probabilities via approximate_distribution")
+        except Exception as e:
+            logger.warning(
+                f"approximate_distribution failed ({e}), using hard assignments"
+            )
+            probs = self.probs
+
+        n_final = sum(1 for t in topics if t == -1)
+        logger.info(
+            f"Outlier reduction complete: {n_before} -> {n_final} outliers "
+            f"({100 * n_final / len(topics):.1f}%)"
+        )
+
+        self.topics = topics
+        self.probs = probs
         return self.topics, self.probs
 
     def fit_transform_venues(
         self,
         venue_reviews: dict[str, list[str]],
         embeddings: Optional[np.ndarray] = None,
+        reduce_outliers: bool = True,
     ) -> pd.DataFrame:
         """
         Fit topics on venue reviews and return venue-topic mapping.
@@ -210,22 +486,66 @@ class VenueTopicExtractor:
         Args:
             venue_reviews: Dict mapping venue_id to list of reviews.
             embeddings: Optional pre-computed venue embeddings.
+            reduce_outliers: Reassign outlier venues to closest topic.
 
         Returns:
-            DataFrame with venue_id, topic, and topic probability.
+            DataFrame with venue_id, topic, topic_prob, topic_name,
+            and was_outlier (bool indicating if originally topic -1).
         """
-        # Aggregate reviews per venue
-        venue_ids = list(venue_reviews.keys())
-        documents = [" ".join(reviews[:10]) for reviews in venue_reviews.values()]  # Limit reviews
+        # Truncate reviews to prevent massive documents
+        documents = [
+            " ".join([str(r)[:500] for r in reviews[:5]])
+            for reviews in venue_reviews.values()
+        ]
 
-        # Fit
-        topics, probs = self.fit(documents, embeddings)
+        # Fit (outlier reduction happens inside fit())
+        topics_before_reduction, _ = self.topic_model.fit_transform(
+            documents, embeddings=embeddings
+        ) if not reduce_outliers else (None, None)
+
+        # Track original outliers BEFORE reduction
+        if reduce_outliers:
+            # Do initial fit without reduction to capture original assignments
+            if self.topic_model is None:
+                self.build_model()
+
+            self.topics, self.probs = self.topic_model.fit_transform(
+                documents, embeddings=embeddings
+            )
+            if embeddings is None and hasattr(self.topic_model, "embedding_model"):
+                self.embeddings = self.topic_model._extract_embeddings(
+                    documents, method="document"
+                )
+            else:
+                self.embeddings = embeddings
+
+            original_outlier_mask = [t == -1 for t in self.topics]
+
+            # Now reduce outliers
+            self.topics, self.probs = self._reduce_outliers(
+                documents, embeddings
+            )
+            topics = self.topics
+            probs = self.probs
+        else:
+            topics, probs = self.fit(
+                documents, embeddings, reduce_outliers=False
+            )
+            original_outlier_mask = [t == -1 for t in topics]
+
+        if probs is None:
+            probs = [1.0] * len(topics)
 
         # Create result DataFrame
+        venue_ids = list(venue_reviews.keys())
         result = pd.DataFrame({
             "venue_id": venue_ids,
             "topic": topics,
-            "topic_prob": [p.max() if isinstance(p, np.ndarray) else p for p in probs],
+            "topic_prob": [
+                p.max() if isinstance(p, np.ndarray) else float(p)
+                for p in probs
+            ],
+            "was_outlier": original_outlier_mask,
         })
 
         # Add topic names
@@ -383,6 +703,7 @@ def extract_venue_topics(
     text_col: str = "clean_text",
     use_kmeans: bool = True,
     n_clusters: int = 50,
+    reduce_outliers: bool = True,
     save_path: Optional[Path] = None,
 ) -> tuple[pd.DataFrame, VenueTopicExtractor]:
     """
@@ -394,6 +715,7 @@ def extract_venue_topics(
         text_col: Column name for review text.
         use_kmeans: Use K-Means clustering.
         n_clusters: Number of clusters for K-Means.
+        reduce_outliers: Reassign outlier venues to closest topic.
         save_path: Path to save the model.
 
     Returns:
@@ -409,12 +731,16 @@ def extract_venue_topics(
     extractor = VenueTopicExtractor(config=config)
     extractor.build_model(use_kmeans=use_kmeans)
 
-    # Fit and get venue topics
-    venue_topics = extractor.fit_transform_venues(venue_reviews)
+    # Fit and get venue topics (with outlier reduction)
+    venue_topics = extractor.fit_transform_venues(
+        venue_reviews, reduce_outliers=reduce_outliers
+    )
 
     # Save if path provided
     if save_path:
         extractor.save(save_path)
-        venue_topics.to_parquet(save_path.parent / "venue_topics.parquet", index=False)
+        venue_topics.to_parquet(
+            save_path.parent / "venue_topics.parquet", index=False
+        )
 
     return venue_topics, extractor
