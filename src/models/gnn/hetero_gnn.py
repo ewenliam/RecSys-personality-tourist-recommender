@@ -166,13 +166,12 @@ class HeteroGNN(nn.Module):
         for node_type in self.node_types:
             self.output_projections[node_type] = nn.Linear(hidden_dim, embedding_dim)
 
-        # Link prediction MLP (user-venue scoring)
-        self.link_predictor = nn.Sequential(
-            nn.Linear(embedding_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+        # NOTE: no MLP link predictor here.  Scoring is done via dot product
+        # on L2-normalized embeddings (= cosine similarity), so the training
+        # objective directly optimizes the retrieval metric used at inference.
+        # An MLP predictor would learn discriminative scores internally while
+        # leaving the embeddings collapsed, making cosine-based retrieval
+        # useless at evaluation time.
 
         self._init_weights()
 
@@ -221,13 +220,19 @@ class HeteroGNN(nn.Module):
 
             h_dict = h_new
 
-        # Project to embedding dimension
+        # Project to embedding dimension and L2-normalize.
+        # L2 normalization is critical: it maps all embeddings onto the unit
+        # hypersphere so that dot product == cosine similarity.  Without it,
+        # nodes with high-norm hidden representations dominate recommendations
+        # regardless of actual affinity.  Combined with BPR loss, this ensures
+        # the training objective directly optimizes cosine-based retrieval.
         emb_dict = {}
         for node_type in h_dict:
             if node_type in self.output_projections:
-                emb_dict[node_type] = self.output_projections[node_type](h_dict[node_type])
+                raw = self.output_projections[node_type](h_dict[node_type])
+                emb_dict[node_type] = F.normalize(raw, p=2, dim=-1)
             else:
-                emb_dict[node_type] = h_dict[node_type]
+                emb_dict[node_type] = F.normalize(h_dict[node_type], p=2, dim=-1)
 
         return emb_dict
 
@@ -239,26 +244,25 @@ class HeteroGNN(nn.Module):
         venue_indices: Tensor,
     ) -> Tensor:
         """
-        Forward pass for link prediction.
+        Forward pass: dot-product score between user and venue embeddings.
+
+        Both embeddings are L2-normalized by encode(), so this is equivalent
+        to cosine similarity.  Scores are in [-1, 1] (no sigmoid applied here;
+        the BPR loss directly uses the raw dot products).
 
         Args:
             x_dict: Node features per type.
             edge_index_dict: Edge indices per type.
-            user_indices: User indices for prediction [batch_size].
-            venue_indices: Venue indices for prediction [batch_size].
+            user_indices: User indices for scoring [batch_size].
+            venue_indices: Venue indices for scoring [batch_size].
 
         Returns:
-            Predicted scores [batch_size] (logits, not probabilities).
+            Dot-product scores [batch_size] in [-1, 1].
         """
         emb_dict = self.encode(x_dict, edge_index_dict)
-
-        user_emb = emb_dict["user"][user_indices]
-        venue_emb = emb_dict["venue"][venue_indices]
-
-        combined = torch.cat([user_emb, venue_emb], dim=1)
-        scores = self.link_predictor(combined).squeeze(-1)
-
-        return scores
+        user_emb = emb_dict["user"][user_indices]   # [B, d], L2-normalized
+        venue_emb = emb_dict["venue"][venue_indices]  # [B, d], L2-normalized
+        return (user_emb * venue_emb).sum(dim=-1)   # cosine similarity
 
     def predict(
         self,
@@ -267,7 +271,7 @@ class HeteroGNN(nn.Module):
         user_indices: Tensor,
         venue_indices: Tensor,
     ) -> Tensor:
-        """Predict with sigmoid activation."""
+        """Dot-product score mapped to [0, 1] via sigmoid (for AUC metrics)."""
         scores = self.forward(x_dict, edge_index_dict, user_indices, venue_indices)
         return torch.sigmoid(scores)
 
@@ -280,7 +284,10 @@ class HeteroGNN(nn.Module):
         exclude_venues: Optional[set] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
-        Get top-k venue recommendations for a user.
+        Get top-k venue recommendations via cosine similarity.
+
+        Because encode() L2-normalizes outputs, dot product here is
+        identical to cosine similarity (no extra normalize step needed).
 
         Args:
             x_dict: Node features per type.
@@ -290,28 +297,22 @@ class HeteroGNN(nn.Module):
             exclude_venues: Venue indices to exclude.
 
         Returns:
-            Tuple of (venue_indices, scores).
+            Tuple of (venue_indices, cosine_scores).
         """
         self.eval()
         with torch.no_grad():
             emb_dict = self.encode(x_dict, edge_index_dict)
+            user_emb = emb_dict["user"][user_idx]   # [d], unit norm
+            venue_emb = emb_dict["venue"]            # [n_v, d], unit norm
 
-            user_emb = emb_dict["user"][user_idx].unsqueeze(0)
-            venue_emb = emb_dict["venue"]
-            num_venues = venue_emb.size(0)
+            scores = venue_emb @ user_emb            # cosine similarity [n_v]
 
-            # Score all venues
-            user_expanded = user_emb.expand(num_venues, -1)
-            combined = torch.cat([user_expanded, venue_emb], dim=1)
-            scores = torch.sigmoid(self.link_predictor(combined).squeeze(-1))
-
-            # Exclude specified venues
             if exclude_venues:
                 for vid in exclude_venues:
-                    if vid < num_venues:
+                    if vid < scores.size(0):
                         scores[vid] = -float("inf")
 
-            top_scores, top_indices = torch.topk(scores, min(k, num_venues))
+            top_scores, top_indices = torch.topk(scores, min(k, scores.size(0)))
 
         return top_indices, top_scores
 

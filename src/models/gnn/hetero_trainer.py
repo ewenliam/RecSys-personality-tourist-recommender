@@ -105,6 +105,12 @@ class HeteroGNNTrainer:
             self.user_positives[u].add(v)
 
         # Loss
+        # BPR directly optimizes the ranking: the model must score positive
+        # (user, venue) pairs higher than negative pairs.  Combined with
+        # L2-normalized dot-product scoring, this aligns training with the
+        # cosine similarity used for retrieval at inference.
+        self.bpr_loss = BPRLoss()
+        # Keep gBCE as optional fallback (used only for AUC reporting)
         if use_gbce:
             self.criterion = gBCELoss(t=gbce_t)
         else:
@@ -149,71 +155,81 @@ class HeteroGNNTrainer:
             negatives.append(user_negs)
         return np.array(negatives)
 
-    def train_epoch(self) -> HeteroGNNMetrics:
-        """Train for one epoch with mini-batching over edges."""
+    @torch.no_grad()
+    def _encode_all_no_grad(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode all nodes without gradient (for evaluation metrics)."""
+        self.model.eval()
+        emb_dict = self.model.encode(self.x_dict, self.edge_index_dict)
+        self.model.train()
+        return emb_dict["user"], emb_dict["venue"]
+
+    def train_epoch(self, num_grad_steps: int = 200) -> HeteroGNNMetrics:
+        """
+        Train for one epoch: multiple BPR steps, each with a full-graph forward.
+
+        Because dot-product scoring has no separate link predictor weights,
+        the encoder IS the scoring function and must receive real gradients.
+        Caching (encode once, detach, then backward) would give zero gradient
+        since the computation graph is broken at the detach point.
+
+        Instead, we run num_grad_steps full-graph forward passes, each using
+        a different random edge sample for BPR loss.  With 1 SAGEConv layer,
+        each pass takes ~2-3 s on this GPU, so 200 steps ≈ 7 min/epoch.
+        This is far cheaper than the old approach (1 full pass per mini-batch
+        = 3,750 passes × 5 negatives = 18,750 passes per epoch).
+
+        Args:
+            num_grad_steps: Number of full-graph forward+backward passes per
+                epoch.  Each step samples 4096 random edges for BPR loss.
+        """
         self.model.train()
         num_edges = self.train_edges.size(1)
-        batch_size = self.config.batch_size
+        step_size = min(4096, num_edges)
 
-        perm = torch.randperm(num_edges)
         total_loss = 0.0
-        num_batches = 0
 
         progress = tqdm(
-            range(0, num_edges, batch_size),
+            range(num_grad_steps),
             desc=f"Epoch {self.current_epoch + 1}/{self.config.num_epochs}",
         )
 
-        for start in progress:
-            end = min(start + batch_size, num_edges)
-            batch_idx = perm[start:end]
-
-            pos_users = self.train_edges[0, batch_idx]
-            pos_venues = self.train_edges[1, batch_idx]
-
-            # Negative sampling
-            neg_venues = self._sample_negatives(pos_users.cpu().numpy())
-            neg_venues = torch.tensor(neg_venues, dtype=torch.long, device=self.device)
-
+        for step in progress:
             self.optimizer.zero_grad()
 
-            # Positive scores
-            pos_scores = self.model(
-                self.x_dict, self.edge_index_dict,
-                pos_users, pos_venues,
+            # Full-graph forward WITH gradient (encoder gets updated)
+            emb_dict = self.model.encode(self.x_dict, self.edge_index_dict)
+            user_emb = emb_dict["user"]
+            venue_emb = emb_dict["venue"]
+
+            # Sample a random edge batch for BPR loss
+            perm = torch.randperm(num_edges, device=self.device)[:step_size]
+            pos_users = self.train_edges[0, perm]
+            pos_venues = self.train_edges[1, perm]
+
+            # Uniform random negatives (fast, avoids Python loop)
+            neg_venues = torch.randint(
+                0, self.num_venues, (step_size,), device=self.device
             )
 
-            # Negative scores (average over negative samples)
-            neg_scores_list = []
-            for j in range(self.num_negatives):
-                ns = self.model(
-                    self.x_dict, self.edge_index_dict,
-                    pos_users, neg_venues[:, j],
-                )
-                neg_scores_list.append(ns)
-            neg_scores = torch.stack(neg_scores_list, dim=1)
+            u = user_emb[pos_users]
+            pos_v = venue_emb[pos_venues]
+            neg_v = venue_emb[neg_venues]
 
-            # gBCE loss on positive and negative predictions
-            pos_loss = self.criterion(
-                torch.sigmoid(pos_scores),
-                torch.ones_like(pos_scores),
-            )
-            neg_loss = self.criterion(
-                torch.sigmoid(neg_scores),
-                torch.zeros_like(neg_scores),
-            )
-            loss = pos_loss + neg_loss
+            # BPR: maximize dot(u, pos_v) - dot(u, neg_v)
+            # Embeddings are L2-normalized so dot == cosine
+            pos_scores = (u * pos_v).sum(dim=-1)
+            neg_scores = (u * neg_v).sum(dim=-1)
+
+            loss = self.bpr_loss(pos_scores, neg_scores)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
 
             total_loss += loss.item()
-            num_batches += 1
             progress.set_postfix({"loss": f"{loss.item():.4f}"})
 
-        avg_loss = total_loss / max(num_batches, 1)
-        return HeteroGNNMetrics(loss=avg_loss)
+        return HeteroGNNMetrics(loss=total_loss / max(num_grad_steps, 1))
 
     @torch.no_grad()
     def evaluate(
@@ -233,7 +249,10 @@ class HeteroGNNTrainer:
         self.model.eval()
         edge_index = edge_index if edge_index is not None else self.val_edges
 
-        # --- AUC ---
+        # Encode once for both AUC and ranking evaluation
+        user_emb, venue_emb = self._encode_all_no_grad()
+
+        # --- AUC (dot product scores via cached embeddings) ---
         num_eval = min(1000, edge_index.size(1))
         sample_perm = torch.randperm(edge_index.size(1))[:num_eval]
         eval_edges = edge_index[:, sample_perm]
@@ -241,14 +260,14 @@ class HeteroGNNTrainer:
         users = eval_edges[0]
         venues = eval_edges[1]
 
-        pos_scores = self.model.predict(
-            self.x_dict, self.edge_index_dict, users, venues
+        pos_scores = torch.sigmoid(
+            (user_emb[users] * venue_emb[venues]).sum(dim=-1)
         )
         neg_venues = torch.randint(
             0, self.num_venues, (num_eval,), device=self.device
         )
-        neg_scores = self.model.predict(
-            self.x_dict, self.edge_index_dict, users, neg_venues
+        neg_scores = torch.sigmoid(
+            (user_emb[users] * venue_emb[neg_venues]).sum(dim=-1)
         )
 
         labels = torch.cat([
@@ -267,9 +286,10 @@ class HeteroGNNTrainer:
         ).sum()
         auc = (rank_sum - num_pos * (num_pos + 1) / 2) / (num_pos * num_neg + 1e-8)
 
-        # --- Ranking metrics ---
+        # --- Ranking metrics (use cached embeddings, not model.recommend()) ---
         ranking_metrics = self._compute_ranking_metrics(
-            edge_index, k=k, num_users=num_eval_users
+            edge_index, user_emb=user_emb, venue_emb=venue_emb,
+            k=k, num_users=num_eval_users
         )
 
         return HeteroGNNMetrics(
@@ -283,10 +303,19 @@ class HeteroGNNTrainer:
     def _compute_ranking_metrics(
         self,
         edge_index: torch.Tensor,
+        user_emb: torch.Tensor,
+        venue_emb: torch.Tensor,
         k: int = 10,
         num_users: int = 100,
     ) -> Dict[str, float]:
-        """Compute ranking metrics for sampled users."""
+        """
+        Compute ranking metrics using pre-computed embeddings.
+
+        Uses cosine similarity (dot product on L2-normalized embeddings)
+        directly, bypassing the GNN re-encode.  This is identical to what
+        evaluate_hybrid.py does, so training metrics are now directly
+        comparable to the final recommendation evaluation.
+        """
         unique_users = torch.unique(edge_index[0])
         if len(unique_users) > num_users:
             sample_idx = torch.randperm(len(unique_users))[:num_users]
@@ -300,28 +329,28 @@ class HeteroGNNTrainer:
         for i in range(edge_cpu.size(1)):
             u = edge_cpu[0, i].item()
             v = edge_cpu[1, i].item()
-            if u not in user_gt:
-                user_gt[u] = set()
-            user_gt[u].add(v)
+            user_gt.setdefault(u, set()).add(v)
 
         calc = RecommendationMetrics()
         all_metrics = []
+
+        venue_emb_cpu = venue_emb.cpu().numpy()
 
         for uid in sample_users.tolist():
             if uid not in user_gt:
                 continue
 
             gt = user_gt[uid]
-            rec_indices, _ = self.model.recommend(
-                self.x_dict, self.edge_index_dict,
-                user_idx=uid, k=k * 2,
-            )
-            recs = rec_indices.cpu().tolist()
+            u_vec = user_emb[uid].cpu().numpy()  # already L2-normalized
+
+            # Cosine similarity = dot product (both sides unit norm)
+            scores = venue_emb_cpu @ u_vec           # [n_venues]
+            top_recs = np.argsort(-scores)[:k * 2].tolist()
 
             all_metrics.append({
-                f"precision@{k}": calc.precision_at_k(recs, gt, k),
-                f"recall@{k}": calc.recall_at_k(recs, gt, k),
-                f"ndcg@{k}": calc.ndcg_at_k(recs, gt, k),
+                f"precision@{k}": calc.precision_at_k(top_recs, gt, k),
+                f"recall@{k}": calc.recall_at_k(top_recs, gt, k),
+                f"ndcg@{k}": calc.ndcg_at_k(top_recs, gt, k),
             })
 
         if not all_metrics:
@@ -382,6 +411,7 @@ class HeteroGNNTrainer:
 
     @torch.no_grad()
     def get_embeddings(self) -> dict[str, torch.Tensor]:
-        """Extract learned embeddings for all node types."""
+        """Extract learned embeddings for all node types (on CPU)."""
         self.model.eval()
-        return self.model.encode(self.x_dict, self.edge_index_dict)
+        emb_dict = self.model.encode(self.x_dict, self.edge_index_dict)
+        return {k: v.cpu() for k, v in emb_dict.items()}

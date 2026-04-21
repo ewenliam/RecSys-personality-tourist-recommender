@@ -122,17 +122,39 @@ def build_graph(
     user_id_map = {uid: idx for idx, uid in enumerate(unique_users)}
     venue_id_map = {vid: idx for idx, vid in enumerate(unique_venues)}
 
-    # User features
-    if "user" in embeddings and len(embeddings["user"]) == len(unique_users):
-        user_features = embeddings["user"]
-    else:
-        logger.info("Generating random user features for demonstration")
-        user_features = np.random.randn(len(unique_users), 768).astype(np.float32)
-        user_features = user_features / (np.linalg.norm(user_features, axis=1, keepdims=True) + 1e-8)
+    # User features.
+    # The pre-loaded LTGNN embeddings are in LTGNN's internal node ordering,
+    # which differs from the pd.unique() ordering used here.  Since we lack
+    # a reliable LTGNN ID mapping for 720K users, we use degree-based
+    # features (log1p of the number of reviews) combined with a random
+    # 32-dim component as a compact, correctly-aligned input representation.
+    # After GNN message-passing, the output embeddings will reflect the
+    # interaction graph structure regardless of the input feature quality.
+    logger.info("Building degree-based user features (avoids misaligned pre-trained embeddings)")
+    u_reviews = interactions.groupby(user_col).size().reindex(unique_users).fillna(0).values
+    u_feat_dim = 32
+    np.random.seed(42)
+    user_features = np.hstack([
+        np.log1p(u_reviews).reshape(-1, 1).astype(np.float32),
+        np.random.randn(len(unique_users), u_feat_dim - 1).astype(np.float32) * 0.1,
+    ])
+    logger.info(f"User features: {user_features.shape}")
 
-    # Venue features
-    if "venue" in embeddings and len(embeddings["venue"]) == len(unique_venues):
-        venue_features = embeddings["venue"]
+    # Venue features: reindex BERTopic embeddings to match pd.unique() ordering.
+    # The BERTopic venue_topics.parquet maps BERTopic row indices to string IDs.
+    # We scatter those rows into the correct positions according to venue_id_map.
+    if "venue" in embeddings and "venue_topics" in embeddings:
+        raw_venue_embs = embeddings["venue"]          # [n_btopic, 768]
+        btopic_venue_ids = embeddings["venue_topics"]["venue_id"].tolist()
+        d = raw_venue_embs.shape[1]
+        venue_features = np.zeros((len(unique_venues), d), dtype=np.float32)
+        matched = 0
+        for b_idx, vid in enumerate(btopic_venue_ids):
+            gnn_idx = venue_id_map.get(vid)
+            if gnn_idx is not None and b_idx < len(raw_venue_embs):
+                venue_features[gnn_idx] = raw_venue_embs[b_idx]
+                matched += 1
+        logger.info(f"Venue features reindexed: {matched}/{len(btopic_venue_ids)} matched, shape={venue_features.shape}")
     else:
         logger.info("Generating random venue features for demonstration")
         venue_features = np.random.randn(len(unique_venues), 768).astype(np.float32)
@@ -241,7 +263,11 @@ def main(args):
     edge_types = list(edge_index_dict.keys())
 
     # Create model
-    num_layers = args.num_layers if args.num_layers else 2
+    # 1 layer prevents over-smoothing on this dense bipartite graph.
+    # With mean degree 41.7, a 2-layer SAGEConv covers ~1740 venues per user
+    # (41.7^2), mixing embeddings across essentially the whole graph and
+    # causing all embeddings to collapse to the global mean.
+    num_layers = args.num_layers if args.num_layers else 1
     model = HeteroGNN(
         node_input_dims=node_input_dims,
         edge_types=edge_types,
