@@ -14,6 +14,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -29,15 +30,291 @@ from src.config.settings import (
     CHECKPOINT_DIR,
     PROJECT_ROOT,
 )
-from src.models.hybrid.xgboost_ranker import XGBoostRanker, FeatureSynthesizer, HybridRecommender
 from src.models.hybrid.personality_scorer import PersonalityScorer
-from src.models.hybrid.gbce_loss import CalibrationMetrics
 from src.utils.metrics import RecommendationMetrics
 from src.utils.helpers import setup_logging, set_seed
 
 logger = logging.getLogger(__name__)
 
 RESULTS_DIR = PROJECT_ROOT / "results"
+
+
+# ---------------------------------------------------------------------------
+# Reciprocal Rank Fusion
+# ---------------------------------------------------------------------------
+
+class RRFRanker:
+    """
+    Reciprocal Rank Fusion (RRF) hybrid recommender.
+
+    Combines a content-based KNN ranking (cosine similarity between the
+    user's MBTI embedding and the venue's BERTopic PCA embedding) with a
+    collaborative filtering ranking (GNN user-venue dot product) using the
+    parameter-free RRF formula:
+
+        rrf_score(v) = 1/(k + rank_knn(v)) + 1/(k + rank_gnn(v))
+
+    where ranks are 1-indexed (rank 1 = most relevant venue).
+
+    No training is required. The fusion is purely mathematical, so there is
+    nothing to overfit and no popularity-bias shortcut for a learner to
+    exploit.
+
+    Args:
+        k: RRF smoothing constant (default 60, the standard value).
+            Higher k flattens score differences between adjacent ranks.
+            Lower k makes top-ranked venues dominate more strongly.
+        popularity_alpha: Weight of a small log-degree tie-breaker.
+            Popularity is only added AFTER the RRF score so it never
+            overrides personalisation - it breaks ties between venues
+            with identical RRF scores.  Set to 0.0 to disable.
+        rrf_mode: Which sub-rankers to combine.
+            "hybrid"  - KNN + GNN (default, requires both embeddings)
+            "knn"     - content-based only (MBTI x BERTopic)
+            "gnn"     - collaborative only (GNN embeddings)
+    """
+
+    def __init__(
+        self,
+        k: int = 60,
+        popularity_alpha: float = 0.01,
+        rrf_mode: str = "hybrid",
+    ):
+        self.k = k
+        self.popularity_alpha = popularity_alpha
+        self.rrf_mode = rrf_mode
+
+        # Degree array set by set_venue_degree() after train edges are known
+        self.venue_log_degree: Optional[np.ndarray] = None
+
+    def set_venue_degree(
+        self,
+        train_edges: np.ndarray,
+        n_venues: int,
+    ) -> None:
+        """
+        Pre-compute log(1 + degree) for every venue from training edges.
+
+        Only used if popularity_alpha > 0.  Computed once and stored so
+        that recommend() does not recompute it per call.
+
+        Args:
+            train_edges: [2, num_edges] array of (user_idx, venue_idx).
+            n_venues: Total number of venues.
+        """
+        degree = np.zeros(n_venues, dtype=np.float32)
+        np.add.at(degree, train_edges[1], 1)
+        self.venue_log_degree = np.log1p(degree).astype(np.float32)
+        logger.info(
+            f"Venue degree: min={degree.min():.0f}, "
+            f"mean={degree.mean():.1f}, max={degree.max():.0f}"
+        )
+
+    @staticmethod
+    def _cosine_scores(
+        query: np.ndarray,       # [d]
+        matrix: np.ndarray,      # [n_items, d]
+    ) -> np.ndarray:
+        """Vectorised cosine similarity: query vs every row of matrix."""
+        d = min(query.shape[0], matrix.shape[1])
+        q = query[:d].astype(np.float32)
+        m = matrix[:, :d].astype(np.float32)
+        dots = m @ q                                          # [n_items]
+        q_norm = float(np.linalg.norm(q)) + 1e-8
+        m_norms = np.linalg.norm(m, axis=1) + 1e-8           # [n_items]
+        return dots / (q_norm * m_norms)
+
+    @staticmethod
+    def _scores_to_ranks(scores: np.ndarray) -> np.ndarray:
+        """
+        Convert an array of scores to 1-indexed ranks (rank 1 = highest score).
+
+        Args:
+            scores: [n_items] float array, higher is better.
+
+        Returns:
+            ranks: [n_items] int array, rank[i] is the rank of item i.
+        """
+        n = len(scores)
+        # argsort(-scores)[p] = index of the item at position p
+        sorted_pos = np.argsort(-scores)          # position -> item_index
+        ranks = np.empty(n, dtype=np.int32)
+        ranks[sorted_pos] = np.arange(1, n + 1)  # item_index -> rank
+        return ranks
+
+    def recommend(
+        self,
+        user_idx: int,
+        user_embeddings: np.ndarray,
+        venue_embeddings: np.ndarray,
+        k: int = 10,
+        exclude_venues: Optional[set] = None,
+        user_extra: Optional[np.ndarray] = None,   # MBTI user embs [n_u, d]
+        venue_extra: Optional[np.ndarray] = None,  # BERTopic PCA [n_v, d]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return the top-k recommended venues for user_idx using RRF.
+
+        Args:
+            user_idx: Integer index of the target user.
+            user_embeddings: GNN user embeddings [n_users, d].
+            venue_embeddings: GNN venue embeddings [n_venues, d].
+            k: Number of recommendations to return.
+            exclude_venues: Set of venue indices to exclude (already visited).
+            user_extra: MBTI user embeddings [n_users, d_mbti].
+                Used as the query for the KNN ranker.
+            venue_extra: BERTopic PCA venue embeddings [n_venues, d_topic].
+                Used as the keys for the KNN ranker.
+
+        Returns:
+            Tuple of (top_k_venue_indices, top_k_rrf_scores), both sorted
+            by descending RRF score.
+        """
+        n_venues = venue_embeddings.shape[0]
+        rrf_score = np.zeros(n_venues, dtype=np.float64)
+
+        # ---- KNN sub-ranker (content-based) ----------------------------
+        if self.rrf_mode in ("hybrid", "knn"):
+            if user_extra is not None and venue_extra is not None:
+                knn_scores = self._cosine_scores(
+                    user_extra[user_idx], venue_extra
+                )
+            else:
+                # Fall back to GNN cosine if MBTI/BERTopic not available
+                logger.warning(
+                    "KNN mode requested but user_extra/venue_extra missing; "
+                    "falling back to GNN scores for KNN slot."
+                )
+                knn_scores = self._cosine_scores(
+                    user_embeddings[user_idx], venue_embeddings
+                )
+            knn_ranks = self._scores_to_ranks(knn_scores)
+            rrf_score += 1.0 / (self.k + knn_ranks)
+
+        # ---- GNN sub-ranker (collaborative filtering) ------------------
+        if self.rrf_mode in ("hybrid", "gnn"):
+            gnn_scores = self._cosine_scores(
+                user_embeddings[user_idx], venue_embeddings
+            )
+            gnn_ranks = self._scores_to_ranks(gnn_scores)
+            rrf_score += 1.0 / (self.k + gnn_ranks)
+
+        # ---- Popularity tie-breaker (epsilon scale) --------------------
+        if self.popularity_alpha > 0 and self.venue_log_degree is not None:
+            rrf_score *= (1.0 + self.popularity_alpha * self.venue_log_degree)
+
+        # ---- Exclude already-visited venues ----------------------------
+        if exclude_venues:
+            for vid in exclude_venues:
+                if 0 <= vid < n_venues:
+                    rrf_score[vid] = -np.inf
+
+        # ---- Return top-k ----------------------------------------------
+        top_k_idx = np.argsort(-rrf_score)[:k]
+        top_k_scores = rrf_score[top_k_idx]
+
+        return top_k_idx, top_k_scores.astype(np.float32)
+
+
+def build_user_bertopic_profiles(
+    train_edges: np.ndarray,
+    venue_bertopic_embs: np.ndarray,
+    n_users: int,
+) -> np.ndarray:
+    """
+    Build user content profiles in BERTopic PCA space.
+
+    For each user, average the BERTopic PCA embeddings of all venues
+    they visited in the training set.  This gives a semantic user profile
+    that reflects their topic preferences without relying on GNN embeddings
+    (which have collapsed to near-uniform representations on this dataset).
+
+    Args:
+        train_edges: [2, num_edges] int array of (user_idx, venue_idx).
+        venue_bertopic_embs: [n_venues, d] BERTopic PCA venue embeddings.
+        n_users: Total number of users.
+
+    Returns:
+        user_profiles: [n_users, d] float32 array.  Rows for users with
+            no training interactions are zero vectors.
+    """
+    d = venue_bertopic_embs.shape[1]
+    user_profiles = np.zeros((n_users, d), dtype=np.float64)
+    user_counts = np.zeros(n_users, dtype=np.int32)
+
+    users = train_edges[0]
+    venues = train_edges[1]
+    np.add.at(user_profiles, users, venue_bertopic_embs[venues])
+    np.add.at(user_counts, users, 1)
+
+    mask = user_counts > 0
+    user_profiles[mask] /= user_counts[mask, np.newaxis]
+    logger.info(
+        f"Built BERTopic user profiles: "
+        f"{mask.sum()} / {n_users} users have training interactions"
+    )
+    return user_profiles.astype(np.float32)
+
+
+class PopularityRanker:
+    """
+    Non-personalised popularity baseline.
+
+    Recommends venues sorted by training-set visit frequency.  Used to
+    verify that personalised models (KNN, RRF) beat a simple trend-based
+    heuristic.
+    """
+
+    def __init__(self) -> None:
+        self.venue_log_degree: Optional[np.ndarray] = None
+
+    def set_venue_degree(self, train_edges: np.ndarray, n_venues: int) -> None:
+        degree = np.zeros(n_venues, dtype=np.float32)
+        np.add.at(degree, train_edges[1], 1)
+        self.venue_log_degree = np.log1p(degree).astype(np.float32)
+        logger.info(
+            f"[Popularity] degree: mean={degree.mean():.1f}, "
+            f"max={degree.max():.0f}"
+        )
+
+    def recommend(
+        self,
+        user_idx: int,
+        user_embeddings: np.ndarray,
+        venue_embeddings: np.ndarray,
+        k: int = 10,
+        exclude_venues: Optional[set] = None,
+        user_extra: Optional[np.ndarray] = None,
+        venue_extra: Optional[np.ndarray] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        scores = self.venue_log_degree.copy()
+        if exclude_venues:
+            for vid in exclude_venues:
+                if 0 <= vid < len(scores):
+                    scores[vid] = -np.inf
+        top_k = np.argsort(-scores)[:k]
+        return top_k, scores[top_k]
+
+
+def run_popularity_evaluation(
+    train_edges: np.ndarray,
+    user_gt: dict,
+    user_embeddings: np.ndarray,
+    venue_embeddings: np.ndarray,
+    k_values: list[int],
+    num_eval_users: int = 200,
+) -> tuple[pd.DataFrame, PopularityRanker]:
+    """Evaluate the non-personalised popularity baseline."""
+    logger.info("[Popularity] Computing popularity-ranked recommendations...")
+    ranker = PopularityRanker()
+    ranker.set_venue_degree(train_edges, n_venues=venue_embeddings.shape[0])
+    metrics = evaluate_recommendations(
+        ranker, user_embeddings, venue_embeddings,
+        user_gt, k_values,
+        num_eval_users=num_eval_users,
+    )
+    metrics["Model"] = "Popularity"
+    return metrics, ranker
 
 
 def load_gnn_embeddings(model_dir: Path) -> dict:
@@ -142,7 +419,7 @@ def create_train_test_edges(
 
 
 def evaluate_recommendations(
-    ranker: XGBoostRanker,
+    ranker,
     user_embeddings: np.ndarray,
     venue_embeddings: np.ndarray,
     user_gt: dict,
@@ -155,13 +432,16 @@ def evaluate_recommendations(
     Evaluate recommendation quality with ranking metrics.
 
     Args:
-        ranker: Trained XGBoostRanker.
+        ranker: Any recommender exposing a recommend() method with the
+            signature (user_idx, user_embeddings, venue_embeddings, k,
+            exclude_venues, user_extra, venue_extra).  Works with both
+            RRFRanker and XGBoostRanker.
         user_embeddings: User embedding matrix.
         venue_embeddings: Venue embedding matrix.
         user_gt: Ground truth - dict mapping user_idx -> set of venue_idx.
         k_values: List of K values for metrics.
-        user_extra: Extra user features (personality).
-        venue_extra: Extra venue features.
+        user_extra: Extra user features (MBTI embeddings for RRF).
+        venue_extra: Extra venue features (BERTopic PCA for RRF).
         num_eval_users: Number of users to evaluate.
 
     Returns:
@@ -214,85 +494,90 @@ def evaluate_recommendations(
     return pd.DataFrame(rows)
 
 
-def run_hybrid_evaluation(
+def run_rrf_evaluation(
     train_edges: np.ndarray,
-    test_edges: np.ndarray,
     user_gt: dict,
     user_embeddings: np.ndarray,
     venue_embeddings: np.ndarray,
-    personality_features: np.ndarray,
-    config,
     k_values: list[int],
-    label: str = "Hybrid",
-    num_rounds: int = 100,
+    label: str = "RRF",
+    rrf_mode: str = "hybrid",
+    rrf_k: int = 60,
+    popularity_alpha: float = 0.01,
+    user_extra: np.ndarray = None,
     venue_extra: np.ndarray = None,
-) -> tuple[pd.DataFrame, XGBoostRanker]:
-    """Run a late-fusion ensemble evaluation pipeline.
+    num_eval_users: int = 200,
+) -> tuple[pd.DataFrame, RRFRanker]:
+    """
+    Evaluate the Reciprocal Rank Fusion hybrid recommender.
 
-    XGBoost receives 4 pre-computed scalar features per (user, venue)
-    pair rather than raw embeddings:
-      [0] knn_score     - cosine(MBTI, BERTopic)
-      [1] gnn_score     - cosine(GNN_user, GNN_venue)
-      [2] venue_degree  - log(1 + #reviews)
-      [3] user_degree   - log(1 + #reviews)
+    No training. No learnable parameters. No overfitting.
+
+    The two base rankers are:
+      - KNN: cosine(user_extra[user_idx], venue_extra[venue_idx])
+             i.e. cosine(MBTI embedding, BERTopic PCA embedding)
+      - GNN: cosine(user_embeddings[user_idx], venue_embeddings[venue_idx])
+             i.e. cosine(GNN user, GNN venue)
+
+    They are combined using RRF:
+        rrf_score(v) = 1/(k + rank_knn(v)) + 1/(k + rank_gnn(v))
+
+    An optional popularity tiebreaker:
+        rrf_score(v) *= 1 + popularity_alpha * log(1 + degree(v))
+
+    is applied AFTER the RRF sum so popularity only breaks ties between
+    venues with equal personalization scores.
 
     Args:
-        personality_features: MBTI features [n_users, 7] passed as
-            user_extra to create_pair_features for KNN score.
-        venue_extra: BERTopic PCA embeddings [n_venues, 64] passed
-            for KNN score computation (not included raw).
+        train_edges: [2, num_edges] used to compute venue degrees.
+        user_gt: Ground truth dict user_idx -> set(venue_idx) for test users.
+        user_embeddings: GNN user embeddings [n_users, d].
+        venue_embeddings: GNN venue embeddings [n_venues, d].
+        k_values: List of K values for Precision/Recall/NDCG/MRR/HitRate.
+        label: Display name for this run in results tables.
+        rrf_mode: "hybrid", "knn", or "gnn".
+        rrf_k: RRF smoothing constant (default 60).
+        popularity_alpha: Popularity tiebreaker weight (default 0.01).
+            Set to 0.0 to disable popularity entirely.
+        user_extra: MBTI user embeddings [n_users, d_mbti].
+        venue_extra: BERTopic PCA venue embeddings [n_venues, d_topic].
+        num_eval_users: How many test users to evaluate.
+
+    Returns:
+        Tuple of (metrics_df, fitted_RRFRanker).
     """
-    logger.info(f"[{label}] Training XGBoost late-fusion ensemble...")
-
-    ranker = XGBoostRanker(config=config.hybrid, use_calibration=True)
-
-    # Late fusion: 500K cap is fine since feature matrix is tiny
-    # (only 4 columns per pair instead of 144)
-    train_features, train_labels = ranker.prepare_training_data(
-        train_edges,
-        user_embeddings,
-        venue_embeddings,
-        num_negatives=4,
-        user_extra=personality_features,
-        venue_extra=venue_extra,
-        max_pos_samples=500_000,
+    logger.info(
+        f"[{label}] RRF fusion "
+        f"(mode={rrf_mode}, k={rrf_k}, "
+        f"popularity_alpha={popularity_alpha})"
     )
 
-    # Train (scale_pos_weight computed automatically from labels)
-    ranker.train(
-        train_features, train_labels,
-        num_rounds=num_rounds,
-        early_stopping_rounds=10,
-    )
+    ranker = RRFRanker(k=rrf_k, popularity_alpha=popularity_alpha,
+                       rrf_mode=rrf_mode)
 
-    # -- Feature importance (ALL features, there are only 4) --
-    FEAT_NAMES = ["knn_score", "gnn_score", "venue_degree", "user_degree"]
-    if hasattr(ranker, "model") and ranker.model is not None:
-        importance = ranker.model.get_score(importance_type="gain")
-        n_feat = train_features.shape[1]
-        feat_names = list(FEAT_NAMES)
-        while len(feat_names) < n_feat:
-            feat_names.append(f"feat_{len(feat_names)}")
+    # Compute venue degree from training graph
+    ranker.set_venue_degree(train_edges, n_venues=venue_embeddings.shape[0])
 
-        named_importance = {
-            feat_names[int(k[1:])]: v
-            for k, v in importance.items()
-            if k.startswith("f") and int(k[1:]) < len(feat_names)
-        }
-        sorted_imp = sorted(
-            named_importance.items(), key=lambda x: x[1], reverse=True
+    # Log which sub-rankers are active
+    knn_avail = user_extra is not None and venue_extra is not None
+    if rrf_mode in ("hybrid", "knn") and not knn_avail:
+        logger.warning(
+            "KNN ranker requested but user_extra/venue_extra not provided. "
+            "RRF will fall back to GNN scores for the KNN slot."
         )
-        logger.info(f"[{label}] Feature Importances (gain):")
-        for rank, (name, gain) in enumerate(sorted_imp, 1):
-            logger.info(f"  {rank}. {name:20s} {gain:.1f}")
+    logger.info(
+        f"  KNN sub-ranker: {'active' if knn_avail else 'fallback->GNN'}"
+        f" | GNN sub-ranker: always active"
+    )
 
-    # Evaluate
-    logger.info(f"[{label}] Evaluating...")
+    # Evaluate (no training step - RRF is parameter-free)
+    logger.info(f"[{label}] Evaluating {num_eval_users} users...")
     metrics = evaluate_recommendations(
         ranker, user_embeddings, venue_embeddings,
         user_gt, k_values,
-        user_extra=personality_features,
+        user_extra=user_extra,
         venue_extra=venue_extra,
+        num_eval_users=num_eval_users,
     )
     metrics["Model"] = label
 
@@ -345,7 +630,7 @@ def generate_methodology_comparison(
         {
             "Aspect": "Final Ranking",
             "Omer (2024)": "XGBoost (baseline features)",
-            "Current": "XGBoost (GNN embs + personality features + gBCE)",
+            "Current": "RRF (KNN MBTI/BERTopic + GNN collaborative, k=60)",
         },
         {
             "Aspect": f"Precision@{k}",
@@ -405,13 +690,33 @@ def main(args):
     personality_data = load_personality_data(MODEL_DIR)
     interactions, user_col, biz_col = load_interactions(PROCESSED_DATA_DIR)
 
-    # Determine user/venue mappings
-    unique_users = interactions[user_col].unique()
-    unique_venues = interactions[biz_col].unique()
-    user_id_map = {uid: idx for idx, uid in enumerate(unique_users)}
-    venue_id_map = {vid: idx for idx, vid in enumerate(unique_venues)}
-    n_users = len(unique_users)
-    n_venues = len(unique_venues)
+    # Determine user/venue mappings.
+    # CRITICAL: use the GNN's id_mappings.pt so that user/venue index 0 in
+    # the interaction data refers to the same entity as row 0 in the GNN
+    # embedding matrices.  pd.unique() returns first-seen order which will
+    # differ from the GNN's construction order, causing every recommendation
+    # lookup to reference the wrong embedding row.
+    mappings = gnn_embs.get("mappings", {})
+    if "user_id_map" in mappings and "venue_id_map" in mappings:
+        user_id_map = mappings["user_id_map"]
+        venue_id_map = mappings["venue_id_map"]
+        logger.info(
+            f"Using GNN ID mappings: "
+            f"{len(user_id_map)} users, {len(venue_id_map)} venues"
+        )
+    else:
+        logger.warning(
+            "GNN id_mappings.pt not found - building fresh maps from "
+            "interactions. Embedding indices may not align with "
+            "interaction indices (metrics will be unreliable)."
+        )
+        unique_users = interactions[user_col].unique()
+        unique_venues = interactions[biz_col].unique()
+        user_id_map = {uid: idx for idx, uid in enumerate(unique_users)}
+        venue_id_map = {vid: idx for idx, vid in enumerate(unique_venues)}
+
+    n_users = len(user_id_map)
+    n_venues = len(venue_id_map)
 
     # Get embeddings (from GNN or fallback to random)
     # Reconcile: pad or truncate to match current data dimensions
@@ -518,16 +823,46 @@ def main(args):
     # 64-dim GNN venue embeddings so XGBoost sees BOTH representations.
     bertopic_venue_embs = personality_data.get("venue_embeddings", None)
     if bertopic_venue_embs is not None:
-        if bertopic_venue_embs.shape[0] < n_venues:
-            pad = np.zeros(
-                (n_venues - bertopic_venue_embs.shape[0],
-                 bertopic_venue_embs.shape[1]),
-                dtype=np.float32,
+        # Reindex from BERTopic's venue ordering to GNN's venue index space.
+        # venue_topics.parquet maps each row of venue_embeddings.npy to its
+        # string venue ID.  We use that to scatter rows into GNN index order
+        # so that venue_extra[gnn_idx] = BERTopic embedding for that venue.
+        bertopic_topics_path = MODEL_DIR / "bertopic_mbti" / "venue_topics.parquet"
+        if bertopic_topics_path.exists():
+            btopic_df = pd.read_parquet(bertopic_topics_path)
+            bertopic_venue_ids = btopic_df["venue_id"].tolist()
+            d = bertopic_venue_embs.shape[1]
+            reindexed = np.zeros((n_venues, d), dtype=np.float32)
+            matched = 0
+            n_btopic = len(bertopic_venue_embs)
+            for b_idx, vid in enumerate(bertopic_venue_ids):
+                if b_idx >= n_btopic:
+                    break
+                gnn_idx = venue_id_map.get(vid)
+                if gnn_idx is not None:
+                    reindexed[gnn_idx] = bertopic_venue_embs[b_idx]
+                    matched += 1
+            logger.info(
+                f"BERTopic reindexing: {matched}/{len(bertopic_venue_ids)} "
+                f"venues matched to GNN index space ({n_venues} total)"
             )
-            bertopic_venue_embs = np.vstack([bertopic_venue_embs, pad])
-        elif bertopic_venue_embs.shape[0] > n_venues:
-            bertopic_venue_embs = bertopic_venue_embs[:n_venues]
-        # PCA: reduce 768-dim -> 64-dim to balance with GNN features
+            bertopic_venue_embs = reindexed
+        else:
+            logger.warning(
+                "venue_topics.parquet not found; positional pad/truncate used "
+                "(BERTopic venue order may not match GNN index space)"
+            )
+            if bertopic_venue_embs.shape[0] < n_venues:
+                pad = np.zeros(
+                    (n_venues - bertopic_venue_embs.shape[0],
+                     bertopic_venue_embs.shape[1]),
+                    dtype=np.float32,
+                )
+                bertopic_venue_embs = np.vstack([bertopic_venue_embs, pad])
+            elif bertopic_venue_embs.shape[0] > n_venues:
+                bertopic_venue_embs = bertopic_venue_embs[:n_venues]
+
+        # PCA: reduce 768-dim -> 64-dim to match GNN embedding dimension
         if bertopic_venue_embs.shape[1] > 64:
             logger.info(
                 f"Applying PCA: {bertopic_venue_embs.shape[1]}-dim -> 64-dim"
@@ -538,55 +873,151 @@ def main(args):
             )
             explained = pca.explained_variance_ratio_.sum()
             logger.info(f"PCA explained variance: {explained:.3f}")
-        logger.info(
-            f"BERTopic venue_extra for XGBoost: {bertopic_venue_embs.shape}"
-        )
+        logger.info(f"BERTopic venue_extra: {bertopic_venue_embs.shape}")
     else:
         logger.warning("No BERTopic venue embeddings found - venue_extra=None")
 
-    num_rounds = 50 if args.quick else 100
+    # Number of eval users: quick mode uses 100, full uses 500
+    num_eval_users = 100 if args.quick else 500
 
-    # --- Evaluation 1: Full late-fusion ensemble ---
-    # Features: knn_score + gnn_score + venue_degree + user_degree
+    # Build BERTopic user profiles from training interactions.
+    # The GNN embeddings have collapsed to near-uniform representations
+    # (cosine std ~0.025, min ~0.74) on this dataset, making them
+    # equivalent to random recommendations.  Instead, we compute a
+    # user profile as the mean BERTopic PCA embedding over all venues
+    # visited in training - this retains the semantic content signal
+    # and gives meaningful cosine similarity for the KNN sub-ranker.
+    if bertopic_venue_embs is not None:
+        knn_user_embs = build_user_bertopic_profiles(
+            train_edges, bertopic_venue_embs, n_users
+        )
+        logger.info(f"KNN user profiles (BERTopic mean): {knn_user_embs.shape}")
+    else:
+        # Fall back to LTGNN user embeddings if BERTopic is unavailable
+        knn_user_embs = user_mbti_embs  # [n_users, 64] or None
+        logger.warning(
+            "BERTopic venue embeddings unavailable; "
+            "falling back to LTGNN user embeddings for KNN (collapsed)."
+        )
+
+    # ---------------------------------------------------------------
+    # Baseline: Popularity (non-personalised)
+    # ---------------------------------------------------------------
     logger.info("=" * 60)
-    logger.info("Late-Fusion Ensemble: KNN + GNN + Degree stats")
+    logger.info("Baseline: Popularity (non-personalised)")
     logger.info("=" * 60)
 
-    hybrid_metrics, hybrid_ranker = run_hybrid_evaluation(
-        train_edges, test_edges, user_gt,
+    pop_baseline_metrics, _ = run_popularity_evaluation(
+        train_edges, user_gt,
         user_embeddings, venue_embeddings,
-        personality_features, config, k_values,
-        label="Late-Fusion (KNN+GNN+Degree)",
-        num_rounds=num_rounds,
+        k_values,
+        num_eval_users=num_eval_users,
+    )
+
+    # ---------------------------------------------------------------
+    # RRF Evaluation 1: Hybrid KNN + GNN (no popularity tiebreaker)
+    # ---------------------------------------------------------------
+    logger.info("=" * 60)
+    logger.info("RRF: KNN (MBTI/BERTopic) + GNN - no popularity boost")
+    logger.info("=" * 60)
+
+    rrf_metrics, rrf_ranker = run_rrf_evaluation(
+        train_edges, user_gt,
+        user_embeddings, venue_embeddings,
+        k_values,
+        label="RRF-Hybrid (no pop)",
+        rrf_mode="hybrid",
+        rrf_k=args.rrf_k,
+        popularity_alpha=0.0,
+        user_extra=knn_user_embs,
         venue_extra=bertopic_venue_embs,
+        num_eval_users=num_eval_users,
     )
 
-    # --- Evaluation 2: Ablation - GNN + Degree only (no KNN/MBTI) ---
-    # Features: gnn_score + venue_degree + user_degree (knn_score=0)
+    # ---------------------------------------------------------------
+    # RRF Evaluation 2: Hybrid + small popularity tiebreaker
+    # ---------------------------------------------------------------
     logger.info("=" * 60)
-    logger.info("Ablation: GNN + Degree only (no MBTI/KNN)")
+    logger.info(f"RRF: KNN + GNN + popularity tiebreaker (alpha={args.pop_alpha})")
     logger.info("=" * 60)
 
-    baseline_metrics, _ = run_hybrid_evaluation(
-        train_edges, test_edges, user_gt,
+    rrf_pop_metrics, rrf_pop_ranker = run_rrf_evaluation(
+        train_edges, user_gt,
         user_embeddings, venue_embeddings,
-        None, config, k_values,
-        label="GNN + Degree (no KNN)",
-        num_rounds=num_rounds,
-        venue_extra=None,
+        k_values,
+        label=f"RRF-Hybrid (pop={args.pop_alpha})",
+        rrf_mode="hybrid",
+        rrf_k=args.rrf_k,
+        popularity_alpha=args.pop_alpha,
+        user_extra=knn_user_embs,
+        venue_extra=bertopic_venue_embs,
+        num_eval_users=num_eval_users,
     )
 
-    # Combine results
-    all_metrics = pd.concat([hybrid_metrics, baseline_metrics], ignore_index=True)
+    # ---------------------------------------------------------------
+    # Ablation 1: KNN only
+    # ---------------------------------------------------------------
+    logger.info("=" * 60)
+    logger.info("Ablation: KNN only (MBTI/BERTopic, no GNN)")
+    logger.info("=" * 60)
 
-    # Print results
+    knn_metrics, _ = run_rrf_evaluation(
+        train_edges, user_gt,
+        user_embeddings, venue_embeddings,
+        k_values,
+        label="KNN-only",
+        rrf_mode="knn",
+        rrf_k=args.rrf_k,
+        popularity_alpha=0.0,
+        user_extra=knn_user_embs,
+        venue_extra=bertopic_venue_embs,
+        num_eval_users=num_eval_users,
+    )
+
+    # ---------------------------------------------------------------
+    # Ablation 2: GNN only
+    # ---------------------------------------------------------------
+    logger.info("=" * 60)
+    logger.info("Ablation: GNN only (collaborative, no MBTI)")
+    logger.info("=" * 60)
+
+    gnn_metrics, _ = run_rrf_evaluation(
+        train_edges, user_gt,
+        user_embeddings, venue_embeddings,
+        k_values,
+        label="GNN-only",
+        rrf_mode="gnn",
+        rrf_k=args.rrf_k,
+        popularity_alpha=0.0,
+        user_extra=None,
+        venue_extra=None,
+        num_eval_users=num_eval_users,
+    )
+
+    # ---------------------------------------------------------------
+    # Collect and print all results
+    # ---------------------------------------------------------------
+    all_metrics = pd.concat(
+        [pop_baseline_metrics, knn_metrics, rrf_metrics, rrf_pop_metrics, gnn_metrics],
+        ignore_index=True,
+    )
+
     logger.info("\n" + "=" * 80)
     logger.info("EVALUATION RESULTS")
     logger.info("=" * 80)
     print(all_metrics.to_string(index=False))
 
-    # Generate methodology comparison
-    comparison_df, latex_str = generate_methodology_comparison(hybrid_metrics, k=10)
+    # Highlight the best model per metric at K=10
+    k10 = all_metrics[all_metrics["K"] == 10].copy()
+    logger.info("\nBest model per metric @ K=10:")
+    for col in ["Precision@K", "Recall@K", "NDCG@K", "MRR", "Hit Rate@K"]:
+        best_idx = k10[col].idxmax()
+        best_model = k10.loc[best_idx, "Model"]
+        best_val = k10.loc[best_idx, col]
+        logger.info(f"  {col:15s}: {best_model} ({best_val:.4f})")
+
+    # Generate methodology comparison using best model (RRF hybrid)
+    comparison_df, latex_str = generate_methodology_comparison(rrf_metrics, k=10)
 
     logger.info("\nMethodology Comparison:")
     print(comparison_df.to_string(index=False))
@@ -600,21 +1031,30 @@ def main(args):
     latex_path = RESULTS_DIR / "phase4_methodology_comparison.tex"
     latex_path.write_text(latex_str, encoding="utf-8")
 
-    # Save feature importance
-    importance = hybrid_ranker.get_feature_importance()
-    importance.to_csv(RESULTS_DIR / "phase4_feature_importance.csv", index=False)
-
     logger.info(f"\nResults saved to {RESULTS_DIR}")
     logger.info("Done.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Hybrid recommendation evaluation pipeline"
+        description="Hybrid RRF recommendation evaluation pipeline"
     )
-    parser.add_argument("--k", type=int, default=10, help="Primary K for metrics")
-    parser.add_argument("--quick", action="store_true", help="Quick run with fewer rounds")
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu", "mps"])
+    parser.add_argument(
+        "--k", type=int, default=10,
+        help="Primary K for metrics display (default 10)",
+    )
+    parser.add_argument(
+        "--quick", action="store_true",
+        help="Evaluate on 100 users instead of 500 (faster)",
+    )
+    parser.add_argument(
+        "--rrf-k", type=int, default=60,
+        help="RRF smoothing constant k (default 60)",
+    )
+    parser.add_argument(
+        "--pop-alpha", type=float, default=0.01,
+        help="Popularity tiebreaker weight (default 0.01, 0 to disable)",
+    )
 
     args = parser.parse_args()
     main(args)

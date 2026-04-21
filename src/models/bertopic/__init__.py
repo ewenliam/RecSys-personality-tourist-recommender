@@ -5,6 +5,7 @@ from .topic_extractor import (
     TopicInfo,
     extract_venue_topics,
 )
+from .mbti_embedder import MBTIEmbedder
 from .geo_cluster import (
     GeoClusterer,
     RegionInfo,
@@ -18,6 +19,7 @@ __all__ = [
     "TextEmbedder",
     "ImageEmbedder",
     "MultimodalEmbedder",
+    "MBTIEmbedder",
     # Topic extraction
     "VenueTopicExtractor",
     "TopicInfo",

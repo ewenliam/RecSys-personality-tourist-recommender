@@ -10,6 +10,7 @@ from .xgboost_ranker import (
     FeatureSynthesizer,
     RankingFeatures,
     HybridRecommender,
+    build_topic_confidence,
 )
 from .gbce_loss import (
     gBCELoss,
@@ -17,6 +18,10 @@ from .gbce_loss import (
     CalibrationMetrics,
     calibrate_predictions,
     compute_overconfidence_penalty,
+)
+from .personality_scorer import (
+    PersonalityScorer,
+    mbti_to_vector,
 )
 
 __all__ = [
@@ -30,10 +35,14 @@ __all__ = [
     "FeatureSynthesizer",
     "RankingFeatures",
     "HybridRecommender",
+    "build_topic_confidence",
     # Calibration
     "gBCELoss",
     "FocalLoss",
     "CalibrationMetrics",
     "calibrate_predictions",
     "compute_overconfidence_penalty",
+    # Personality
+    "PersonalityScorer",
+    "mbti_to_vector",
 ]

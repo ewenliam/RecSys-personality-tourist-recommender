@@ -9,7 +9,10 @@ from .settings import (
     get_config,
     PROJECT_ROOT,
     DATA_DIR,
+    RAW_DATA_DIR,
+    PROCESSED_DATA_DIR,
     MODEL_DIR,
+    CHECKPOINT_DIR,
 )
 
 __all__ = [
@@ -22,5 +25,8 @@ __all__ = [
     "get_config",
     "PROJECT_ROOT",
     "DATA_DIR",
+    "RAW_DATA_DIR",
+    "PROCESSED_DATA_DIR",
     "MODEL_DIR",
+    "CHECKPOINT_DIR",
 ]
