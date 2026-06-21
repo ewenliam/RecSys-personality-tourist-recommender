@@ -122,23 +122,28 @@ def build_graph(
     user_id_map = {uid: idx for idx, uid in enumerate(unique_users)}
     venue_id_map = {vid: idx for idx, vid in enumerate(unique_venues)}
 
-    # User features.
-    # The pre-loaded LTGNN embeddings are in LTGNN's internal node ordering,
-    # which differs from the pd.unique() ordering used here.  Since we lack
-    # a reliable LTGNN ID mapping for 720K users, we use degree-based
-    # features (log1p of the number of reviews) combined with a random
-    # 32-dim component as a compact, correctly-aligned input representation.
-    # After GNN message-passing, the output embeddings will reflect the
-    # interaction graph structure regardless of the input feature quality.
-    logger.info("Building degree-based user features (avoids misaligned pre-trained embeddings)")
-    u_reviews = interactions.groupby(user_col).size().reindex(unique_users).fillna(0).values
-    u_feat_dim = 32
-    np.random.seed(42)
-    user_features = np.hstack([
-        np.log1p(u_reviews).reshape(-1, 1).astype(np.float32),
-        np.random.randn(len(unique_users), u_feat_dim - 1).astype(np.float32) * 0.1,
-    ])
-    logger.info(f"User features: {user_features.shape}")
+    # User features: review statistics provide behavioral signal that
+    # differentiates users beyond graph structure alone.
+    logger.info("Building user features from review statistics")
+    rating_col_name = rating_col if rating_col else None
+
+    user_stats = interactions.groupby(user_col).agg(
+        n_reviews=(biz_col, "count"),
+        **({"mean_stars": (rating_col_name, "mean"),
+            "std_stars": (rating_col_name, "std")} if rating_col_name else {}),
+    ).reindex(unique_users).fillna(0)
+
+    feat_cols = [np.log1p(user_stats["n_reviews"].values).reshape(-1, 1).astype(np.float32)]
+    if rating_col_name:
+        feat_cols.append(
+            ((user_stats["mean_stars"].values - 3.0) / 2.0).reshape(-1, 1).astype(np.float32)
+        )
+        feat_cols.append(
+            user_stats["std_stars"].fillna(0).values.reshape(-1, 1).astype(np.float32)
+        )
+
+    user_features = np.hstack(feat_cols)
+    logger.info(f"User features: {user_features.shape} (review stats)")
 
     # Venue features: reindex BERTopic embeddings to match pd.unique() ordering.
     # The BERTopic venue_topics.parquet maps BERTopic row indices to string IDs.
@@ -295,7 +300,7 @@ def main(args):
         checkpoint_dir=CHECKPOINT_DIR / "gnn_hetero",
         use_gbce=True,
         gbce_t=config.hybrid.gbce_calibration_t,
-        num_negatives=4,
+        num_negatives=8,  # 4 hard (popularity-weighted) + 4 easy (uniform)
     )
 
     # Train
@@ -356,7 +361,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
-    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu", "mps"])
     parser.add_argument("--quick", action="store_true", help="Quick run with reduced epochs")
 

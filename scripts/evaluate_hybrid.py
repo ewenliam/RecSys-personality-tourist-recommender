@@ -995,10 +995,34 @@ def main(args):
     )
 
     # ---------------------------------------------------------------
+    # Ablation 3: KNN + popularity (no GNN)
+    # Isolates the GNN's contribution: if KNN+pop already matches the full
+    # hybrid, the popularity tiebreaker - not the GNN - is doing the work.
+    # The full hybrid must beat THIS to claim the GNN adds collaborative value.
+    # ---------------------------------------------------------------
+    logger.info("=" * 60)
+    logger.info(f"Ablation: KNN + popularity (no GNN, alpha={args.pop_alpha})")
+    logger.info("=" * 60)
+
+    knn_pop_metrics, _ = run_rrf_evaluation(
+        train_edges, user_gt,
+        user_embeddings, venue_embeddings,
+        k_values,
+        label=f"KNN+pop (no GNN)",
+        rrf_mode="knn",
+        rrf_k=args.rrf_k,
+        popularity_alpha=args.pop_alpha,
+        user_extra=knn_user_embs,
+        venue_extra=bertopic_venue_embs,
+        num_eval_users=num_eval_users,
+    )
+
+    # ---------------------------------------------------------------
     # Collect and print all results
     # ---------------------------------------------------------------
     all_metrics = pd.concat(
-        [pop_baseline_metrics, knn_metrics, rrf_metrics, rrf_pop_metrics, gnn_metrics],
+        [pop_baseline_metrics, knn_metrics, knn_pop_metrics,
+         rrf_metrics, rrf_pop_metrics, gnn_metrics],
         ignore_index=True,
     )
 

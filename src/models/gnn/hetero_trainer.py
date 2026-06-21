@@ -60,6 +60,7 @@ class HeteroGNNTrainer:
         use_gbce: bool = True,
         gbce_t: float = 0.8,
         num_negatives: int = 4,
+        temperature: float = 0.1,
     ):
         """
         Initialize the heterogeneous GNN trainer.
@@ -87,6 +88,14 @@ class HeteroGNNTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.num_negatives = num_negatives
         self.num_venues = num_venues
+        # Temperature for cosine-similarity logits.  L2-normalized dot products
+        # live in [-1, 1]; dividing by tau (<1) expands them to [-1/tau, 1/tau]
+        # so BPR can push positives well above negatives.  Without this the
+        # logit range is too compressed and the loss plateaus near 0.45 with
+        # the model unable to separate positives from negatives.  Since this
+        # scales ALL scores uniformly, it does not change the argsort ranking
+        # used at inference - it only sharpens the training gradient.
+        self.temperature = temperature
 
         # Move data to device
         self.model.to(self.device)
@@ -103,6 +112,21 @@ class HeteroGNNTrainer:
             if u not in self.user_positives:
                 self.user_positives[u] = set()
             self.user_positives[u].add(v)
+
+        # Popularity-weighted negative-sampling distribution.
+        # Uniform random negatives are too easy: a random venue out of 85K is
+        # trivially distinguishable from a visited one, so the model achieves
+        # high AUC (pos vs random neg) while learning nothing useful for top-K
+        # ranking, where it must beat the few hundred *plausible* venues.
+        # Popular venues are the hard negatives - plausible for many users, so
+        # the model must learn to recommend them only when they actually match,
+        # rather than defaulting to popularity.  degree^0.75 smoothing (the
+        # word2vec trick) tempers the head so the most popular venues do not
+        # dominate every batch.
+        venue_deg = torch.zeros(num_venues, dtype=torch.float)
+        vids, counts = torch.unique(train_user_venue_edges[1], return_counts=True)
+        venue_deg[vids.long()] = counts.float()
+        self.neg_sample_weights = (venue_deg + 1.0).pow(0.75).to(self.device)
 
         # Loss
         # BPR directly optimizes the ranking: the model must score positive
@@ -206,21 +230,34 @@ class HeteroGNNTrainer:
             pos_users = self.train_edges[0, perm]
             pos_venues = self.train_edges[1, perm]
 
-            # Uniform random negatives (fast, avoids Python loop)
-            neg_venues = torch.randint(
-                0, self.num_venues, (step_size,), device=self.device
+            # Mix of easy (uniform) and hard (popularity-weighted) negatives.
+            # Easy negatives keep training stable; hard negatives (popular,
+            # plausible venues) force the model to learn genuine collaborative
+            # preference for top-K ranking.  Averaging BPR over several
+            # negatives also lowers gradient variance.
+            n_hard = self.num_negatives // 2
+            n_easy = self.num_negatives - n_hard
+            neg_hard = torch.multinomial(
+                self.neg_sample_weights, step_size * n_hard, replacement=True
+            ).view(step_size, n_hard)
+            neg_easy = torch.randint(
+                0, self.num_venues, (step_size, n_easy), device=self.device
             )
+            neg_venues = torch.cat([neg_hard, neg_easy], dim=1)
 
-            u = user_emb[pos_users]
-            pos_v = venue_emb[pos_venues]
-            neg_v = venue_emb[neg_venues]
+            u = user_emb[pos_users]                       # [B, d]
+            pos_v = venue_emb[pos_venues]                 # [B, d]
+            neg_v = venue_emb[neg_venues]                 # [B, n_neg, d]
 
-            # BPR: maximize dot(u, pos_v) - dot(u, neg_v)
-            # Embeddings are L2-normalized so dot == cosine
-            pos_scores = (u * pos_v).sum(dim=-1)
-            neg_scores = (u * neg_v).sum(dim=-1)
+            # Temperature-scaled cosine similarity (embeddings L2-normalized).
+            pos_scores = (u * pos_v).sum(dim=-1) / self.temperature        # [B]
+            neg_scores = (u.unsqueeze(1) * neg_v).sum(dim=-1) / self.temperature  # [B, n_neg]
 
-            loss = self.bpr_loss(pos_scores, neg_scores)
+            # BPR over each negative, then average across negatives.
+            loss = self.bpr_loss(
+                pos_scores.unsqueeze(1).expand_as(neg_scores),
+                neg_scores,
+            )
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -276,7 +313,10 @@ class HeteroGNNTrainer:
         ])
         scores = torch.cat([pos_scores, neg_scores])
 
-        sorted_indices = torch.argsort(scores, descending=True)
+        # Wilcoxon-Mann-Whitney AUC: sort ascending (rank 1 = lowest score).
+        # Positives that score higher than negatives end up at high rank positions,
+        # giving rank_sum >> n_pos*(n_pos+1)/2 -> AUC close to 1.
+        sorted_indices = torch.argsort(scores, descending=False)
         sorted_labels = labels[sorted_indices]
         num_pos = sorted_labels.sum()
         num_neg = len(sorted_labels) - num_pos
@@ -370,7 +410,9 @@ class HeteroGNNTrainer:
             train_metrics = self.train_epoch()
             self.train_history.append(train_metrics)
 
-            val_metrics = self.evaluate()
+            # Evaluate on 500 users so per-epoch NDCG is stable enough for
+            # reliable early-stopping and best-model selection.
+            val_metrics = self.evaluate(num_eval_users=500)
             self.val_history.append(val_metrics)
 
             self.scheduler.step()
