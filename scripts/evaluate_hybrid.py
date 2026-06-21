@@ -74,6 +74,17 @@ class RRFRanker:
             "gnn"     - collaborative only (GNN embeddings)
     """
 
+    # Map a mode string to the set of sub-rankers it activates.
+    _MODE_RANKERS = {
+        "knn": {"knn"},
+        "gnn": {"gnn"},
+        "mbti": {"mbti"},
+        "hybrid": {"knn", "gnn"},
+        "knn+mbti": {"knn", "mbti"},
+        "gnn+mbti": {"gnn", "mbti"},
+        "full": {"knn", "gnn", "mbti"},
+    }
+
     def __init__(
         self,
         k: int = 60,
@@ -83,6 +94,8 @@ class RRFRanker:
         self.k = k
         self.popularity_alpha = popularity_alpha
         self.rrf_mode = rrf_mode
+        # Which sub-rankers are active for this mode.
+        self.active = self._MODE_RANKERS.get(rrf_mode, {"knn", "gnn"})
 
         # Degree array set by set_venue_degree() after train edges are known
         self.venue_log_degree: Optional[np.ndarray] = None
@@ -149,8 +162,10 @@ class RRFRanker:
         venue_embeddings: np.ndarray,
         k: int = 10,
         exclude_venues: Optional[set] = None,
-        user_extra: Optional[np.ndarray] = None,   # MBTI user embs [n_u, d]
+        user_extra: Optional[np.ndarray] = None,   # BERTopic user profile [n_u, d]
         venue_extra: Optional[np.ndarray] = None,  # BERTopic PCA [n_v, d]
+        user_mbti: Optional[np.ndarray] = None,    # BERT-MBTI user CLS [n_u, 768]
+        venue_mbti: Optional[np.ndarray] = None,   # BERT-MBTI venue CLS [n_v, 768]
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Return the top-k recommended venues for user_idx using RRF.
@@ -173,8 +188,8 @@ class RRFRanker:
         n_venues = venue_embeddings.shape[0]
         rrf_score = np.zeros(n_venues, dtype=np.float64)
 
-        # ---- KNN sub-ranker (content-based) ----------------------------
-        if self.rrf_mode in ("hybrid", "knn"):
+        # ---- KNN sub-ranker (content-based: visited-venue profile) -----
+        if "knn" in self.active:
             if user_extra is not None and venue_extra is not None:
                 knn_scores = self._cosine_scores(
                     user_extra[user_idx], venue_extra
@@ -192,12 +207,21 @@ class RRFRanker:
             rrf_score += 1.0 / (self.k + knn_ranks)
 
         # ---- GNN sub-ranker (collaborative filtering) ------------------
-        if self.rrf_mode in ("hybrid", "gnn"):
+        if "gnn" in self.active:
             gnn_scores = self._cosine_scores(
                 user_embeddings[user_idx], venue_embeddings
             )
             gnn_ranks = self._scores_to_ranks(gnn_scores)
             rrf_score += 1.0 / (self.k + gnn_ranks)
+
+        # ---- MBTI sub-ranker (personality from the user's own writing) -
+        # cosine(user BERT-MBTI CLS, venue BERT-MBTI CLS).  Distinct from KNN:
+        # KNN profiles a user by venues they visited, this profiles them by how
+        # they write - a pure personality-compatibility signal.
+        if "mbti" in self.active and user_mbti is not None and venue_mbti is not None:
+            mbti_scores = self._cosine_scores(user_mbti[user_idx], venue_mbti)
+            mbti_ranks = self._scores_to_ranks(mbti_scores)
+            rrf_score += 1.0 / (self.k + mbti_ranks)
 
         # ---- Popularity tie-breaker (epsilon scale) --------------------
         if self.popularity_alpha > 0 and self.venue_log_degree is not None:
@@ -256,6 +280,52 @@ def build_user_bertopic_profiles(
     return user_profiles.astype(np.float32)
 
 
+def build_venue_mbti_profiles(
+    train_edges: np.ndarray,
+    user_mbti_embs: np.ndarray,
+    n_venues: int,
+) -> np.ndarray:
+    """
+    Build venue personality profiles as the mean MBTI embedding of visitors.
+
+    For each venue, average the BERT-MBTI CLS embeddings of all users who
+    visited it in training.  This places venues in the SAME discriminative
+    user-personality space, so cosine(user_mbti, venue_profile) answers
+    "do people with my personality visit here?" - a personality-collaborative
+    signal.  This is far more discriminative than venue review-text CLS
+    embeddings (which barely vary: cosine std ~0.04), because it is grounded
+    in who actually goes there.
+
+    Args:
+        train_edges: [2, num_edges] int array of (user_idx, venue_idx).
+        user_mbti_embs: [n_users, d] BERT-MBTI user CLS embeddings.
+        n_venues: Total number of venues.
+
+    Returns:
+        venue_profiles: [n_venues, d] float32, L2-normalised.  Venues with no
+            training visitors are left as zero vectors.
+    """
+    d = user_mbti_embs.shape[1]
+    venue_profiles = np.zeros((n_venues, d), dtype=np.float64)
+    venue_counts = np.zeros(n_venues, dtype=np.int32)
+
+    users = train_edges[0]
+    venues = train_edges[1]
+    np.add.at(venue_profiles, venues, user_mbti_embs[users])
+    np.add.at(venue_counts, venues, 1)
+
+    mask = venue_counts > 0
+    venue_profiles[mask] /= venue_counts[mask, np.newaxis]
+    venue_profiles[mask] /= (
+        np.linalg.norm(venue_profiles[mask], axis=1, keepdims=True) + 1e-8
+    )
+    logger.info(
+        f"Built venue MBTI profiles (visitor-mean): "
+        f"{mask.sum()} / {n_venues} venues have training visitors"
+    )
+    return venue_profiles.astype(np.float32)
+
+
 class PopularityRanker:
     """
     Non-personalised popularity baseline.
@@ -286,6 +356,7 @@ class PopularityRanker:
         exclude_venues: Optional[set] = None,
         user_extra: Optional[np.ndarray] = None,
         venue_extra: Optional[np.ndarray] = None,
+        **kwargs,  # absorb user_mbti/venue_mbti (unused by popularity)
     ) -> tuple[np.ndarray, np.ndarray]:
         scores = self.venue_log_degree.copy()
         if exclude_venues:
@@ -360,6 +431,56 @@ def load_personality_data(model_dir: Path) -> dict:
     return data
 
 
+def load_user_mbti_embeddings(
+    model_dir: Path,
+    user_id_map: dict,
+    n_users: int,
+) -> Optional[np.ndarray]:
+    """
+    Load per-user BERT-MBTI CLS embeddings and align to the GNN user index.
+
+    Reads models/bert_mbti/user_mbti_embeddings.npy (row order matches
+    user_mbti_ids.parquet) and scatters each row into the GNN index space
+    via user_id_map.  Returns None if the files are absent so the caller can
+    skip the MBTI ranker gracefully.
+
+    Args:
+        model_dir: MODEL_DIR root.
+        user_id_map: dict mapping user_id string -> GNN user index.
+        n_users: Total number of users in GNN index space.
+
+    Returns:
+        [n_users, 768] float32 array, or None.
+    """
+    emb_path = model_dir / "bert_mbti" / "user_mbti_embeddings.npy"
+    ids_path = model_dir / "bert_mbti" / "user_mbti_ids.parquet"
+    if not emb_path.exists() or not ids_path.exists():
+        logger.warning(
+            f"User MBTI embeddings not found at {emb_path}; "
+            "MBTI ranker will be unavailable. Run scripts/extract_user_mbti.py."
+        )
+        return None
+
+    raw = np.load(emb_path).astype(np.float32)
+    ids = pd.read_parquet(ids_path)["user_id"].tolist()
+
+    d = raw.shape[1]
+    aligned = np.zeros((n_users, d), dtype=np.float32)
+    matched = 0
+    for row_idx, uid in enumerate(ids):
+        if row_idx >= len(raw):
+            break
+        gnn_idx = user_id_map.get(uid)
+        if gnn_idx is not None:
+            aligned[gnn_idx] = raw[row_idx]
+            matched += 1
+    logger.info(
+        f"User MBTI embeddings: {matched}/{len(ids)} aligned to GNN index "
+        f"space ({n_users} total), dim={d}"
+    )
+    return aligned
+
+
 def load_interactions(data_dir: Path) -> tuple[pd.DataFrame, str, str]:
     """Load interaction data and identify columns."""
     dfs = []
@@ -426,6 +547,8 @@ def evaluate_recommendations(
     k_values: list[int],
     user_extra: np.ndarray = None,
     venue_extra: np.ndarray = None,
+    user_mbti: np.ndarray = None,
+    venue_mbti: np.ndarray = None,
     num_eval_users: int = 200,
 ) -> pd.DataFrame:
     """
@@ -469,6 +592,8 @@ def evaluate_recommendations(
             exclude_venues=None,
             user_extra=user_extra,
             venue_extra=venue_extra,
+            user_mbti=user_mbti,
+            venue_mbti=venue_mbti,
         )
 
         recs = rec_indices.tolist()
@@ -506,6 +631,8 @@ def run_rrf_evaluation(
     popularity_alpha: float = 0.01,
     user_extra: np.ndarray = None,
     venue_extra: np.ndarray = None,
+    user_mbti: np.ndarray = None,
+    venue_mbti: np.ndarray = None,
     num_eval_users: int = 200,
 ) -> tuple[pd.DataFrame, RRFRanker]:
     """
@@ -560,14 +687,10 @@ def run_rrf_evaluation(
 
     # Log which sub-rankers are active
     knn_avail = user_extra is not None and venue_extra is not None
-    if rrf_mode in ("hybrid", "knn") and not knn_avail:
-        logger.warning(
-            "KNN ranker requested but user_extra/venue_extra not provided. "
-            "RRF will fall back to GNN scores for the KNN slot."
-        )
+    mbti_avail = user_mbti is not None and venue_mbti is not None
     logger.info(
-        f"  KNN sub-ranker: {'active' if knn_avail else 'fallback->GNN'}"
-        f" | GNN sub-ranker: always active"
+        f"  active rankers: {sorted(ranker.active)} "
+        f"(knn_avail={knn_avail}, mbti_avail={mbti_avail})"
     )
 
     # Evaluate (no training step - RRF is parameter-free)
@@ -577,6 +700,8 @@ def run_rrf_evaluation(
         user_gt, k_values,
         user_extra=user_extra,
         venue_extra=venue_extra,
+        user_mbti=user_mbti,
+        venue_mbti=venue_mbti,
         num_eval_users=num_eval_users,
     )
     metrics["Model"] = label
@@ -877,6 +1002,27 @@ def main(args):
     else:
         logger.warning("No BERTopic venue embeddings found - venue_extra=None")
 
+    # -- Per-user BERT-MBTI embeddings (personality from own reviews) ----
+    # Produced by scripts/extract_user_mbti.py, keyed by user_id string.
+    user_mbti_embs = load_user_mbti_embeddings(MODEL_DIR, user_id_map, n_users)
+    venue_mbti_embs = None
+    if user_mbti_embs is not None:
+        # Mean-center user embeddings to counter BERT CLS anisotropy (all
+        # vectors clustered in a narrow cone -> washed-out cosine), then
+        # renormalise so cosine is meaningful.
+        u_mean = user_mbti_embs[user_mbti_embs.any(axis=1)].mean(axis=0, keepdims=True)
+        user_mbti_embs = user_mbti_embs - u_mean
+        user_mbti_embs /= (np.linalg.norm(user_mbti_embs, axis=1, keepdims=True) + 1e-8)
+
+        # Venue personality = mean MBTI of its visitors (in centered space).
+        # This is far more discriminative than venue review-text CLS because
+        # it is grounded in WHO visits, not what the reviews say.  cosine here
+        # answers "do people with my personality go here?".
+        venue_mbti_embs = build_venue_mbti_profiles(
+            train_edges, user_mbti_embs, n_venues
+        )
+        logger.info("MBTI: user embeddings centered; venue profiles = visitor-mean")
+
     # Number of eval users: quick mode uses 100, full uses 500
     num_eval_users = 100 if args.quick else 500
 
@@ -1018,13 +1164,63 @@ def main(args):
     )
 
     # ---------------------------------------------------------------
+    # Ablation 4: MBTI only (personality from the user's own writing)
+    # ---------------------------------------------------------------
+    mbti_metrics = None
+    full_metrics = None
+    if user_mbti_embs is not None and venue_mbti_embs is not None:
+        logger.info("=" * 60)
+        logger.info("Ablation: MBTI only (BERT-MBTI user CLS vs venue CLS)")
+        logger.info("=" * 60)
+
+        mbti_metrics, _ = run_rrf_evaluation(
+            train_edges, user_gt,
+            user_embeddings, venue_embeddings,
+            k_values,
+            label="MBTI-only",
+            rrf_mode="mbti",
+            rrf_k=args.rrf_k,
+            popularity_alpha=0.0,
+            user_mbti=user_mbti_embs,
+            venue_mbti=venue_mbti_embs,
+            num_eval_users=num_eval_users,
+        )
+
+        # -----------------------------------------------------------
+        # Full hybrid: KNN + GNN + MBTI + popularity tiebreaker
+        # The headline model - personality drives recommendations directly.
+        # -----------------------------------------------------------
+        logger.info("=" * 60)
+        logger.info(f"FULL: KNN + GNN + MBTI + pop (alpha={args.pop_alpha})")
+        logger.info("=" * 60)
+
+        full_metrics, _ = run_rrf_evaluation(
+            train_edges, user_gt,
+            user_embeddings, venue_embeddings,
+            k_values,
+            label=f"Full (KNN+GNN+MBTI+pop)",
+            rrf_mode="full",
+            rrf_k=args.rrf_k,
+            popularity_alpha=args.pop_alpha,
+            user_extra=knn_user_embs,
+            venue_extra=bertopic_venue_embs,
+            user_mbti=user_mbti_embs,
+            venue_mbti=venue_mbti_embs,
+            num_eval_users=num_eval_users,
+        )
+
+    # ---------------------------------------------------------------
     # Collect and print all results
     # ---------------------------------------------------------------
-    all_metrics = pd.concat(
-        [pop_baseline_metrics, knn_metrics, knn_pop_metrics,
-         rrf_metrics, rrf_pop_metrics, gnn_metrics],
-        ignore_index=True,
-    )
+    metric_frames = [
+        pop_baseline_metrics, knn_metrics, knn_pop_metrics,
+        rrf_metrics, rrf_pop_metrics, gnn_metrics,
+    ]
+    if mbti_metrics is not None:
+        metric_frames.append(mbti_metrics)
+    if full_metrics is not None:
+        metric_frames.append(full_metrics)
+    all_metrics = pd.concat(metric_frames, ignore_index=True)
 
     logger.info("\n" + "=" * 80)
     logger.info("EVALUATION RESULTS")
