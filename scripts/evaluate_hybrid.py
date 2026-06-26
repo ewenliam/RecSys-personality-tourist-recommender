@@ -804,7 +804,7 @@ def generate_methodology_comparison(
 def main(args):
     """Run the hybrid evaluation pipeline."""
     setup_logging(level=logging.INFO)
-    set_seed(42)
+    set_seed(args.seed)
 
     config = get_config()
     k_values = [5, 10, 20]
@@ -1245,7 +1245,10 @@ def main(args):
     # Save results
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    all_metrics.to_csv(RESULTS_DIR / "phase4_hybrid_metrics.csv", index=False)
+    metrics_out = Path(args.out) if args.out else (RESULTS_DIR / "phase4_hybrid_metrics.csv")
+    metrics_out.parent.mkdir(parents=True, exist_ok=True)
+    all_metrics["seed"] = args.seed
+    all_metrics.to_csv(metrics_out, index=False)
     comparison_df.to_csv(RESULTS_DIR / "phase4_methodology_comparison.csv", index=False)
 
     latex_path = RESULTS_DIR / "phase4_methodology_comparison.tex"
@@ -1274,6 +1277,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pop-alpha", type=float, default=0.01,
         help="Popularity tiebreaker weight (default 0.01, 0 to disable)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for user sampling (default 42)",
+    )
+    parser.add_argument(
+        "--out", type=str, default=None,
+        help="Optional path to write the metrics CSV "
+             "(default results/phase4_hybrid_metrics.csv)",
     )
 
     args = parser.parse_args()
