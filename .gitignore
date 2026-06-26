@@ -37,18 +37,19 @@ models/bertopic/topic_embeddings.npy
 models/bertopic/venue_embeddings.npy
 models/bertopic/topic_barchart.html
 models/bertopic/topic_visualization.html
-models/bertopic/topic_model/
-models/bertopic_mbti/
-models/bertopic_v2/
-models/bert_mbti/
-models/gnn/user_gnn_embeddings.npy
-models/gnn/venue_gnn_embeddings.npy
-models/gnn_hetero/
-# Catch-all: never commit large model binaries / outputs
-models/
+/models/bertopic/topic_model/
+/models/bertopic_mbti/
+/models/bertopic_v2/
+/models/bert_mbti/
+/models/gnn/user_gnn_embeddings.npy
+/models/gnn/venue_gnn_embeddings.npy
+/models/gnn_hetero/
+# Catch-all: never commit large model binaries / outputs (top-level models/
+# only - leading slash so it does NOT match the src/models/ source tree).
+/models/
 
 # Local-only docs (supervisor email, briefings - keep off GitHub)
-docs/
+/docs/
 
 # Misc artefacts
 NUL

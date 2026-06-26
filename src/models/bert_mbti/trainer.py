@@ -14,7 +14,10 @@ from torch.optim.lr_scheduler import OneCycleLR
 # Import autocast and GradScaler for Mixed Precision
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    balanced_accuracy_score,
+)
 from src.config.settings import BERTConfig, get_config, CHECKPOINT_DIR
 from src.utils.helpers import save_checkpoint, EarlyStopping
 from .model import MBTIClassifier
@@ -33,6 +36,10 @@ class TrainingMetrics:
     ns_acc: float
     ft_acc: float
     jp_acc: float
+    # Honest, imbalance-aware metrics (raw accuracy hides majority-class
+    # collapse on the skewed E/I and S/N heads).
+    mean_balanced_acc: float = 0.0
+    macro_f1: float = 0.0
 
 class MBTITrainer:
     """Trainer for the MBTI classifier."""
@@ -78,13 +85,17 @@ class MBTITrainer:
             anneal_strategy="linear",
         )
 
+        # Early stopping / best-model selection track mean balanced accuracy
+        # (higher is better).  Val loss is not comparable once the loss is
+        # class-weighted, and raw accuracy rewards majority-class collapse.
         self.early_stopping = EarlyStopping(
             patience=self.config.early_stopping_patience,
-            mode="min",
+            mode="max",
         )
 
         self.current_epoch = 0
         self.best_val_loss = float("inf")
+        self.best_metric = -float("inf")  # best mean balanced accuracy
         self.train_history = []
         self.val_history = []
 
@@ -181,14 +192,25 @@ class MBTITrainer:
                 all_preds[d].extend(preds.cpu().numpy())
                 all_labels[d].extend(labels[d].cpu().numpy())
 
-        # Calculate individual dimension accuracies
+        # Per-dimension raw accuracy AND balanced accuracy.  Balanced accuracy
+        # = mean of per-class recall, so a head that just predicts the majority
+        # class scores ~0.5 here even if its raw accuracy looks high.
         dim_accs = {d: accuracy_score(all_labels[d], all_preds[d]) for d in dims}
-        
-        # Calculate global metrics for the main columns of your table
-        # We flatten the results to treat all 4 trait-decisions equally
-        # Inside MBTITrainer.validate
+        dim_bal = {d: balanced_accuracy_score(all_labels[d], all_preds[d]) for d in dims}
+        dim_f1 = {d: f1_score(all_labels[d], all_preds[d], average="macro") for d in dims}
+
+        mean_bal = float(np.mean([dim_bal[d] for d in dims]))
+        macro_f1 = float(np.mean([dim_f1[d] for d in dims]))
+
+        # Global flattened metrics (kept for backward compatibility / tables)
         flat_labels = np.concatenate([all_labels[d] for d in dims])
         flat_preds = np.concatenate([all_preds[d] for d in dims])
+
+        logger.info(
+            "  per-dim balanced acc: "
+            + " ".join(f"{d}={dim_bal[d]:.3f}" for d in dims)
+            + f" | mean_bal={mean_bal:.3f} macroF1={macro_f1:.3f}"
+        )
 
         return TrainingMetrics(
             loss=total_loss / len(self.val_loader),
@@ -199,7 +221,9 @@ class MBTITrainer:
             ei_acc=dim_accs["EI"],
             ns_acc=dim_accs["SN"],
             ft_acc=dim_accs["TF"],
-            jp_acc=dim_accs["JP"]
+            jp_acc=dim_accs["JP"],
+            mean_balanced_acc=mean_bal,
+            macro_f1=macro_f1,
         )
     
     def train(self) -> dict:
@@ -211,20 +235,29 @@ class MBTITrainer:
             val_metrics = self.validate()
             self.val_history.append(val_metrics)
 
-            logger.info(f"Epoch {epoch+1}: Train Loss {train_metrics.loss:.4f}, Val Acc {val_metrics.accuracy:.4f}")
+            logger.info(
+                f"Epoch {epoch+1}: Train Loss {train_metrics.loss:.4f}, "
+                f"Val Acc {val_metrics.accuracy:.4f}, "
+                f"Val mean-balanced-acc {val_metrics.mean_balanced_acc:.4f}, "
+                f"macroF1 {val_metrics.macro_f1:.4f}"
+            )
 
-            is_best = val_metrics.loss < self.best_val_loss
+            # Select the best checkpoint by mean balanced accuracy.
+            is_best = val_metrics.mean_balanced_acc > self.best_metric
             if is_best:
+                self.best_metric = val_metrics.mean_balanced_acc
                 self.best_val_loss = val_metrics.loss
             self.save_checkpoint(is_best=is_best)
 
-            if self.early_stopping(val_metrics.loss):
+            if self.early_stopping(val_metrics.mean_balanced_acc):
+                logger.info(f"Early stopping at epoch {epoch + 1}")
                 break
 
         return {
             "train_history": [vars(m) for m in self.train_history],
             "val_history": [vars(m) for m in self.val_history],
             "best_val_loss": self.best_val_loss,
+            "best_mean_balanced_acc": self.best_metric,
         }
 
     def save_checkpoint(self, is_best: bool = False) -> None:

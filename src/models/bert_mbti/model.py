@@ -207,6 +207,15 @@ class MBTIMultiLabelClassifier(nn.Module):
             for dim in self.DIMENSIONS
         })
 
+        # Optional per-dimension class weights for the loss.  Set via
+        # set_class_weights() from the training-set label frequencies so the
+        # minority class (e.g. "E", "S") is not ignored.  None -> unweighted.
+        self.class_weights: Optional[dict[str, torch.Tensor]] = None
+
+    def set_class_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        """Provide per-dimension class weights, e.g. {'EI': tensor([w_E, w_I])}."""
+        self.class_weights = weights
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -240,12 +249,17 @@ class MBTIMultiLabelClassifier(nn.Module):
 
         result = {"logits": logits}
 
-        # Calculate loss if labels provided
+        # Calculate loss if labels provided.  Each dimension uses its own
+        # class weights (if set) so imbalanced heads (E/I, S/N) are trained to
+        # predict the minority class rather than collapsing to the prior.
         if labels is not None:
-            loss_fn = nn.CrossEntropyLoss()
             total_loss = 0.0
             for dim in self.DIMENSIONS:
                 if dim in labels:
+                    weight = None
+                    if self.class_weights is not None and dim in self.class_weights:
+                        weight = self.class_weights[dim].to(logits[dim].device)
+                    loss_fn = nn.CrossEntropyLoss(weight=weight)
                     total_loss += loss_fn(logits[dim], labels[dim])
             result["loss"] = total_loss / len(self.DIMENSIONS)
 

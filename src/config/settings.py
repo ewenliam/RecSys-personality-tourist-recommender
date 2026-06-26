@@ -52,6 +52,10 @@ class BERTConfig:
     gradient_clip: float = 1.0
     early_stopping_patience: int = 3
     num_labels: int = 16  # 16 MBTI types
+    # Per-dimension class-weighted loss to counter E/I and S/N imbalance.
+    # Preferred over upsampling, which duplicated minority rows and pushed
+    # the model below the majority-class baseline on the skewed dimensions.
+    use_class_weights: bool = True
 
 
 @dataclass
