@@ -13,8 +13,15 @@ Usage:
 """
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
+
+# UMAP -> numba tries to link Intel SVML symbols (e.g. __svml_sqrtf16) that are
+# not present in this environment, causing a hard "LLVM ERROR: Symbol not
+# found" crash.  Disabling SVML makes numba fall back to standard math.  Must
+# be set BEFORE numba is first imported (it is imported lazily by UMAP).
+os.environ.setdefault("NUMBA_DISABLE_INTEL_SVML", "1")
 
 import numpy as np
 import pandas as pd
