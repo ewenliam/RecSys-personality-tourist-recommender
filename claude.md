@@ -1,29 +1,77 @@
 # Tourist Recommendation System Implementation Plan
 
+> **NOTE (final state):** The phase-by-phase plan below is the original roadmap
+> and is kept for history. Several components were revised after empirical
+> evidence; the accurate description of the system that produced the final
+> results is in **"Final Architecture & Results (as built)"** immediately below.
+> Where the phase notes and the as-built section disagree, the as-built section
+> is correct.
+
 ## Project Overview
 
 Build a personalized tourist recommendation system that integrates:
 - MBTI personality prediction from user reviews (BERT)
-- Multimodal topic modeling (BERTopic + CLIP)
-- Graph Neural Networks for user-venue relationships (LTGNN)
-- Hybrid recommendation engine (XGBoost + gBCE loss)
+- Personality-informed topic modeling (BERTopic with BERT-MBTI CLS embeddings)
+- Graph Neural Network for user-venue relationships (heterogeneous GraphSAGE)
+- Parameter-free hybrid ranking (Reciprocal Rank Fusion of four signals)
 
-**Data Sources**: Yelp Dataset (Business, Review, User, Image) + Kaggle MBTI Dataset
+**Data Sources**: Yelp Dataset (Business, Review, User) + Kaggle MBTI Dataset
 **Thesis Reference**: Omer Amac's MSc thesis (methodology corrections applied)
+
+---
+
+## Final Architecture & Results (as built)
+
+This section overrides any stale claims in the phase notes below.
+
+### What changed from the original plan
+| Original plan | Final system | Why |
+|---------------|--------------|-----|
+| GNN: **LTGNN** (homogeneous LightGCN) | **Heterogeneous GraphSAGE** (`hetero_gnn.py`, `train_hetero_gnn.py`) | LightGCN's conv is parameter-free; GraphSAGE learns per-edge-type transforms so personality/topic features are first-class |
+| Ranker: **XGBoost + gBCE** | **Reciprocal Rank Fusion (RRF)** of 4 signals | Parameter-free: nothing to overfit, no popularity shortcut |
+| GNN loss: **gBCE (t=0.8)** | **BPR** + temperature ($\tau$=0.1) + hard negatives | gBCE retained only for AUC/calibration reporting |
+| MBTI fix = split-then-upsample (~69%) | **User-disjoint split + per-dimension class weights**, balanced-acc selection, per-user eval | Found post-level leakage (100% val users in train) and class-prior collapse |
+| Venue personality from review text | **Visitor-mean** MBTI profile | Review-text venue embeddings barely vary (cosine std ~0.04); visitor-mean is discriminative |
+
+### Final MBTI classifier (honest, user-disjoint test)
+- Per-user accuracy **0.801**, mean balanced accuracy **0.752**, exact 16-type **0.445**.
+- All four axes genuinely learned (balanced acc: E/I 0.696, S/N 0.782, T/F 0.836, J/P 0.693).
+
+### Final recommender (5 seeds, K=10, mean)
+- Full hybrid (KNN content + GNN + MBTI + popularity) best on all 5 metrics:
+  NDCG@10 **0.0153**, MRR **0.0238**, Hit Rate@10 **0.0524** (2.4x popularity baseline).
+
+### The four RRF signals
+1. **Content (KNN)**: cosine(user BERTopic profile, venue BERTopic PCA-64).
+2. **Collaborative (GNN)**: cosine(GraphSAGE user, GraphSAGE venue).
+3. **Personality (MBTI)**: cosine(user BERT-MBTI CLS, venue visitor-mean profile).
+4. **Popularity**: small log-degree tie-breaker (alpha=0.01), applied after fusion.
+
+### Reproduce the final pipeline
+```bash
+python scripts/train_mbti.py --epochs 4          # honest classifier (~8h)
+python scripts/rebuild_pipeline.py               # topics -> user_mbti -> gnn -> robustness
+```
+Environment pin: **numpy==1.26.4** and `NUMBA_DISABLE_INTEL_SVML=1` (for UMAP).
+Thesis sources: `docs/thesis/` (outline, WUT LaTeX project, tables, figures).
 
 ---
 
 ## Critical Methodology Fix (vs. Omer's Thesis)
 
-Omer's original approach had **data leakage**: upsampling BEFORE train/test split inflated MBTI accuracy to ~94%. Our corrected approach:
+Omer's original approach had **data leakage**: upsampling BEFORE train/test split inflated MBTI accuracy to ~94%. A later audit (`scripts/diagnose_mbti.py`) found a **second** leak and a class-imbalance artefact, so the final correction goes further than the original two-step fix:
 
-| Step | Omer (Flawed) | Corrected |
-|------|---------------|-----------|
-| 1 | Upsample all data | Split first (80/10/10) |
-| 2 | Then split | Upsample training set only |
-| Result | ~94% accuracy (inflated) | ~69% accuracy (honest) |
+| Aspect | Omer (Flawed) | Final correction |
+|--------|---------------|------------------|
+| Upsampling | Upsample all data, then split | Split first; **class-weighted loss** instead of upsampling |
+| Split unit | Post level (100% val users also in train) | **User-disjoint** split |
+| Model selection | Val loss | **Mean balanced accuracy** |
+| Evaluation | Per-post accuracy | **Per-user** (majority vote) + balanced accuracy |
+| Result | ~94% (inflated/leaked) | **80.1% acc / 75.2% balanced** (honest, all 4 axes learned) |
 
-Script: `scripts/compare_methodology.py` generates LaTeX comparison tables.
+> The ~69% figure in the phase notes was an intermediate result before the full audit.
+
+Scripts: `scripts/diagnose_mbti.py` (audit), `scripts/generate_thesis_assets.py` (LaTeX tables/figures).
 
 ---
 
@@ -272,12 +320,17 @@ results/                        # Output directory for evaluation results
 
 ## Technical Specifications
 
+> Reflects the **final** system (see "Final Architecture & Results" at the top).
+
 | Component | Technology | Key Detail |
 |-----------|------------|------------|
-| MBTI Classifier | BERT (`bert-base-uncased`) | 4 binary heads, gradient checkpointing |
-| Topic Modeling | BERTopic + CLIP | MBTI-informed embeddings optional |
-| Graph Convolution | Sparse LightGCN | `torch.sparse.mm`, cached adjacency |
-| Fixed-Point Iteration | 5 iterations, alpha=0.5 | Learnable iteration weights |
-| Final Ranking | XGBoost + gBCE (t=0.8) | Personality features + GNN embeddings |
-| Pattern Mining | DCI Closed | Compact behavioral profiles |
-| Clustering | K-Means (topics), HDBSCAN (geo) | Grouping and segmentation |
+| MBTI Classifier | BERT (`bert-base-uncased`) | 4 binary heads, class-weighted loss, user-disjoint eval |
+| Topic Modeling | BERTopic (BERT-MBTI CLS) | personality-informed venue embeddings |
+| Graph Model | Heterogeneous GraphSAGE | per-edge-type learned transforms, 1 layer |
+| GNN Training | BPR + temperature (0.1) | hard negatives; gBCE kept for calibration reporting only |
+| Final Ranking | Reciprocal Rank Fusion (RRF) | parameter-free fusion of 4 signals, k=60 |
+| Personality signal | Visitor-mean MBTI profile | venue = mean MBTI of its visitors |
+
+> Earlier-explored components not in the final pipeline: LTGNN (`ltgnn.py`),
+> XGBoost ranker, gBCE training loss, DCI-Closed mining, CLIP multimodal,
+> HDBSCAN geo-clustering. Kept in the repo as alternatives/history.
