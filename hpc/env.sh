@@ -8,12 +8,10 @@
 # settings.py). Because every stage reads the same config, the classifier,
 # topic, and per-user embedding steps stay consistent automatically.
 
-# --- 1. Cluster modules --------------------------------------------------
-# TODO: run `module avail` on the login node and adjust these names to what
-# the cluster actually provides (versions will differ).
+# --- 1. Cluster modules (verified against `module avail` on hpc.ii.pw.edu.pl) -
 module purge
-module load python/3.11      # e.g. python/3.11 or anaconda3
-module load cuda/12.1        # match the CUDA your torch build expects
+module load python/3.11.15
+module load cuda/12.9
 
 # --- 2. Project virtual environment -------------------------------------
 source "$HOME/recsys-env/bin/activate"
