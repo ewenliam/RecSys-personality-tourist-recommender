@@ -1,0 +1,4 @@
+# Shell and SLURM scripts must use LF endings so they run on the Linux HPC.
+# (CRLF causes "/bin/bash^M: bad interpreter" errors.)
+*.sh    text eol=lf
+*.slurm text eol=lf
