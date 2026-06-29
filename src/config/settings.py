@@ -1,6 +1,7 @@
 """
 Configuration settings for the Tourist Recommendation System.
 """
+import os
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -40,10 +41,17 @@ class DataConfig:
 
 @dataclass
 class BERTConfig:
-    """BERT MBTI classifier configuration."""
-    model_name: str = "bert-base-uncased"
-    max_length: int = 128
-    batch_size: int = 32         # Updated to match Table 6.3
+    """BERT MBTI classifier configuration.
+
+    The backbone, context length, and batch size are read from environment
+    variables when set, so the same code runs the small laptop configuration
+    (defaults) and the larger HPC configuration without edits. The HPC SLURM
+    scripts export these (see hpc/). All stages read this single config, so the
+    classifier, topic, and per-user embedding steps stay consistent.
+    """
+    model_name: str = os.environ.get("MBTI_MODEL_NAME", "bert-base-uncased")
+    max_length: int = int(os.environ.get("MBTI_MAX_LENGTH", "128"))
+    batch_size: int = int(os.environ.get("MBTI_BATCH_SIZE", "32"))
     optimizer: str = "AdamW"      # New: Explicitly state the optimizer
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
