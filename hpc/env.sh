@@ -9,6 +9,9 @@
 # topic, and per-user embedding steps stay consistent automatically.
 
 # --- 1. Cluster modules (verified against `module avail` on hpc.ii.pw.edu.pl) -
+# SLURM batch jobs run in a non-login shell where Lmod is not initialised,
+# so source it explicitly before using `module`.
+if ! command -v module >/dev/null 2>&1; then source /etc/profile.d/z00_lmod.sh; fi
 module purge
 module load python/3.11.15
 module load cuda/12.9
