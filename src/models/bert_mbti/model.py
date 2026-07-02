@@ -37,9 +37,11 @@ class MBTIClassifier(nn.Module):
         super().__init__()
         self.config = config or get_config().bert
 
-        # Load BERT model
+        # Load BERT model. Force fp32: deberta-v3 ships fp16 weights, which
+        # break the AMP GradScaler ("Attempting to unscale FP16 gradients").
         if pretrained:
-            self.bert = AutoModel.from_pretrained(self.config.model_name)
+            self.bert = AutoModel.from_pretrained(
+                self.config.model_name, torch_dtype=torch.float32)
         else:
             bert_config = AutoConfig.from_pretrained(self.config.model_name)
             self.bert = AutoModel.from_config(bert_config)
@@ -191,9 +193,10 @@ class MBTIMultiLabelClassifier(nn.Module):
         super().__init__()
         self.config = config or get_config().bert
 
-        # Load BERT model
+        # Load BERT model (fp32 forced; see MBTIClassifier above).
         if pretrained:
-            self.bert = AutoModel.from_pretrained(self.config.model_name)
+            self.bert = AutoModel.from_pretrained(
+                self.config.model_name, torch_dtype=torch.float32)
         else:
             bert_config = AutoConfig.from_pretrained(self.config.model_name)
             self.bert = AutoModel.from_config(bert_config)

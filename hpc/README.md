@@ -83,15 +83,23 @@ robustness tables land in `results/phase4_robustness_*.csv`. Copy them down with
 ---
 
 ## Tuning knobs (in `env.sh`)
-| Variable | Laptop | HPC (upgraded) | Notes |
-|----------|--------|----------------|-------|
-| `MBTI_MODEL_NAME` | `bert-base-uncased` | `roberta-base` | `deberta-v3-base` is stronger (needs sentencepiece) |
+| Variable | Canonical | Ablation alternates | Notes |
+|----------|-----------|---------------------|-------|
+| `MBTI_MODEL_NAME` | `bert-base-uncased` | `roberta-base`, `microsoft/deberta-v3-base` | deberta needs sentencepiece + fp32 load |
 | `MBTI_MAX_LENGTH` | 128 | 256 | 512 also fits on 96 GB |
-| `MBTI_BATCH_SIZE` | 32 | 64 | raise further if VRAM allows |
+| `MBTI_BATCH_SIZE` | 32 | 64 | 16 on the 11-12 GB titan nodes |
 
-## Important: the numbers will change
-Running with a different backbone and context length will produce **different**
-(expected: better, more honest) classifier and recommender numbers than the
-laptop run currently written into the thesis. After the HPC run, re-copy the
-result CSVs, regenerate the tables/figures, and **update the thesis numbers**
-accordingly. Keep a note of which configuration produced which results.
+## Outcome: the ablation is done, bert stays canonical
+The backbone/context ablation was run on this cluster (see the thesis section
+"Backbone and context ablation"). Honest user-disjoint per-user balanced
+accuracy: bert/128 0.752, roberta/256 0.740, deberta-v3/128 0.743,
+deberta-v3/256 0.761 -- and bert's own 3-seed spread is 0.742-0.772
+(`hpc/multiseed_bert.slurm`, `results/bertvar_metrics.csv`). Every alternative
+lands inside that spread, so **bert-base-uncased/128 remains the canonical
+configuration** and no downstream (stage 2) rerun is needed. The laptop-trained
+canonical pipeline and its thesis numbers stand.
+
+Practical notes from the runs: compute nodes are offline (pre-download
+backbones on the login node); deberta-v3 must be loaded in fp32 or the AMP
+GradScaler fails; node `h86` once stalled a job silently for hours, so
+multi-run scripts wrap each run in `timeout` (see `multiseed_bert.slurm`).

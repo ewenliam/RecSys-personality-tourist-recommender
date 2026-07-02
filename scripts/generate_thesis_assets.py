@@ -72,8 +72,8 @@ def latex_main_table(agg, k=10):
     lines = [
         "\\begin{table}[t]", "\\centering",
         f"\\caption{{Recommendation performance at $K={k}$ "
-        "(mean $\\pm$ std over 5 seeds). Best per column in \\textbf{{bold}}.}}",
-        "\\label{tab:main-results}",
+        "(mean $\\pm$ std over 5 seeds). Best per column in \\textbf{bold}.}",
+        f"\\label{{tab:main-results-k{k}}}",
         "\\resizebox{\\textwidth}{!}{%",
         "\\begin{tabular}{lccccc}", "\\toprule",
         "Model & Precision@" + str(k) + " & Recall@" + str(k)

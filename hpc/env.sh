@@ -3,10 +3,10 @@
 # Source this from each SLURM script:  source hpc/env.sh
 #
 # It (1) loads the cluster modules, (2) activates the project venv, and
-# (3) exports the UPGRADED model configuration (stronger backbone + longer
-# context) that the code reads via environment variables (see src/config/
-# settings.py). Because every stage reads the same config, the classifier,
-# topic, and per-user embedding steps stay consistent automatically.
+# (3) exports the model configuration that the code reads via environment
+# variables (see src/config/settings.py). Because every stage reads the same
+# config, the classifier, topic, and per-user embedding steps stay consistent
+# automatically.
 
 # --- 1. Cluster modules (verified against `module avail` on hpc.ii.pw.edu.pl) -
 # SLURM batch jobs run in a non-login shell where Lmod is not initialised,
@@ -19,13 +19,18 @@ module load cuda/12.9
 # --- 2. Project virtual environment -------------------------------------
 source "$HOME/recsys-env/bin/activate"
 
-# --- 3. Upgraded model configuration (96 GB GPU lets us scale up) -------
-# Stronger backbone + longer context than the 8 GB laptop run.
-export MBTI_MODEL_NAME="roberta-base"   # stronger drop-in; 768-dim
-# Alternative (often best for classification): microsoft/deberta-v3-base
-#   -> requires `pip install sentencepiece` and a fast tokenizer.
-export MBTI_MAX_LENGTH=256              # was 128 on the laptop
-export MBTI_BATCH_SIZE=64               # larger batch on the big GPU
+# --- 3. Model configuration ----------------------------------------------
+# OUTCOME of the backbone/context ablation run on this cluster:
+# roberta-base/256 and deberta-v3-base/{128,256} all land inside bert's own
+# seed-to-seed spread (balanced acc 0.742-0.772 over seeds 42/123/7), so the
+# canonical configuration REMAINS bert-base-uncased/128 -- the dataset, not
+# model capacity, is the ceiling. Alternates kept for reproducing the
+# ablation: roberta-base (256/64); microsoft/deberta-v3-base (256/64, needs
+# `pip install sentencepiece` and MUST be loaded in fp32, see
+# src/models/bert_mbti/model.py).
+export MBTI_MODEL_NAME="bert-base-uncased"
+export MBTI_MAX_LENGTH=128
+export MBTI_BATCH_SIZE=32
 
 # --- 4. Offline HuggingFace (compute nodes usually have no internet) -----
 # Pre-download the backbone ONCE on the login node (see hpc/README.md),

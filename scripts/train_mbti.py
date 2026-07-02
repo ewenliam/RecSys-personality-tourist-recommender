@@ -132,6 +132,7 @@ def split_users_and_explode(
     test_size: float = 0.2,
     val_ratio: float = 0.5,
     upsample: bool = False,
+    seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     USER-LEVEL split, then explode posts within each split.
@@ -153,8 +154,8 @@ def split_users_and_explode(
         (train_df, val_df, test_df) post-level frames, user-disjoint, each
         carrying 'user_id' for per-user evaluation.
     """
-    train_u, temp_u = _stratified_user_split(users_df, test_size, seed=42)
-    val_u, test_u = _stratified_user_split(temp_u, val_ratio, seed=42)
+    train_u, temp_u = _stratified_user_split(users_df, test_size, seed=seed)
+    val_u, test_u = _stratified_user_split(temp_u, val_ratio, seed=seed)
     logger.info(
         f"User-level split: train={len(train_u)} val={len(val_u)} "
         f"test={len(test_u)} users (disjoint)"
@@ -258,6 +259,8 @@ def main(args):
     if args.learning_rate:
         config.bert.learning_rate = args.learning_rate
 
+    if args.seed is not None:
+        config.data.random_seed = args.seed
     set_seed(config.data.random_seed)
     device = get_device(args.device)
 
@@ -271,7 +274,8 @@ def main(args):
     # weights instead; only upsample if class weights are disabled.
     use_class_weights = getattr(config.bert, "use_class_weights", True)
     use_upsample = config.data.upsample_minority and not use_class_weights
-    train_df, val_df, test_df = split_users_and_explode(users_df, upsample=use_upsample)
+    train_df, val_df, test_df = split_users_and_explode(
+        users_df, upsample=use_upsample, seed=config.data.random_seed)
 
     # Determine text column
     text_col = "clean_text" if "clean_text" in train_df.columns else "text"
@@ -377,6 +381,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--resume", type=str, default=None,
         help="Checkpoint filename to resume from",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed controlling the user split AND init "
+             "(for multi-seed robustness runs)",
     )
 
     args = parser.parse_args()
