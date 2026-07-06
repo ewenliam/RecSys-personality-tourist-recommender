@@ -86,3 +86,4 @@ htmlcov/
 tmp/
 temp/
 *.tmp
+demo/__pycache__/

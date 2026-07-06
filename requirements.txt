@@ -29,6 +29,9 @@ fastapi>=0.100.0
 uvicorn>=0.22.0
 python-multipart>=0.0.6
 
+# Interactive demo
+streamlit>=1.30.0
+
 # Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0
