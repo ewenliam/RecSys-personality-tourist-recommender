@@ -156,6 +156,21 @@ def show_traits(traits: np.ndarray):
         col.progress(conf, text=f"{first}/{second} -> {letter} ({conf:.0%})")
 
 
+@st.cache_resource(show_spinner="Loading planner + BERT (first plan)...")
+def load_planner():
+    from src.planner.assets import PlannerAssets
+    from src.explain.text_attrib import MBTIExplainer
+    return PlannerAssets(), MBTIExplainer(device="cpu")
+
+
+@st.cache_data(show_spinner=False)
+def planner_cities(_passets) -> list[str]:
+    vm = _passets.venue_meta
+    df = vm[_passets.venue_geo["has_hours"].to_numpy()]
+    counts = df["city"].value_counts()
+    return counts[counts >= 30].head(40).index.tolist()
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -178,7 +193,8 @@ assets = load_assets()
 
 with st.sidebar:
     st.header("Settings")
-    mode = st.radio("Mode", ["Existing user", "New user (cold start)"])
+    mode = st.radio("Mode", ["Existing user", "New user (cold start)",
+                             "Plan my day"])
     top_k = st.slider("Top-K", 5, 30, 10)
     st.subheader("Signals")
     use_content = st.checkbox("Content (BERTopic KNN)", value=True)
@@ -236,7 +252,7 @@ if mode == "Existing user":
         )
 
 # -------------------------------------------------------------- cold start --
-else:
+elif mode == "New user (cold start)":
     st.subheader("New user: personality from text")
     st.write(
         "Paste a few sentences the user has written (reviews, posts). The "
@@ -285,3 +301,70 @@ else:
                 "for a brand-new user the personality pathway alone already "
                 "produces a personalised ranking - the cold-start argument."
             )
+
+# ---------------------------------------------------------------- plan day --
+else:
+    st.subheader("Plan a personality-conditioned day")
+    st.write(
+        "Paste a persona's text and pick a city. The system infers "
+        "personality, ranks the city's venues, plans a feasible single-day "
+        "itinerary (opening hours, travel time, and a time budget), and "
+        "explains **every stop with a faithful, auditable trace** - no "
+        "language model, just the pipeline's own arithmetic."
+    )
+    passets, explainer = load_planner()
+    cities = planner_cities(passets)
+
+    c1, c2 = st.columns([2, 1])
+    text = c1.text_area("Persona text", height=180, placeholder=(
+        "e.g. I avoid crowded, loud places. A quiet coffee shop with a "
+        "bookshelf, a small gallery, or a calm park is my ideal afternoon. "
+        "Big parties drain me and I plan my day carefully in advance."))
+    city = c2.selectbox("City", cities)
+    day = c2.selectbox("Day", ["mon", "tue", "wed", "thu", "fri", "sat",
+                               "sun"], index=5)
+    start_h, end_h = c2.slider("Day window (hour)", 6, 23, (10, 21))
+
+    if st.button("Infer, plan & explain", type="primary") and text.strip():
+        from src.planner.interfaces import Persona
+        from src.planner.candidates import candidate_set
+        from src.planner.orienteering import plan_itinerary
+        from src.explain.trace import explain_itinerary
+
+        with st.spinner("Inferring personality..."):
+            m_vec, traits = explainer.embed(text, passets.mbti_center)
+        show_traits(traits)
+
+        persona = Persona(persona_id="demo", city=city, text=text, day=day,
+                          start_min=start_h * 60, end_min=end_h * 60)
+        with st.spinner("Ranking venues and planning the day..."):
+            cands = candidate_set(persona, passets, m_vec, top_n=50)
+            itin = plan_itinerary(persona, cands, passets)
+        with st.spinner("Computing word-level explanations..."):
+            attributions = explainer.occlusion(text)
+            traces = explain_itinerary(persona, itin, m_vec, traits,
+                                       passets, attributions)
+
+        if not itin.stops:
+            st.warning("No feasible itinerary for this city and day - try a "
+                       "wider day window.")
+        else:
+            st.success(
+                f"{len(itin.stops)} stops, {itin.total_travel_min:.0f} min "
+                f"total travel, cumulative preference {itin.total_score:.3f} "
+                f"(all stops feasible by construction).")
+            geo = passets.venue_geo
+            pts = pd.DataFrame({
+                "lat": [float(geo["lat"].iloc[s.venue_idx]) for s in itin.stops],
+                "lon": [float(geo["lon"].iloc[s.venue_idx]) for s in itin.stops],
+            })
+            st.map(pts, size=60)
+            for t in traces:
+                st.markdown(f"**{t['position'] + 1}. {t['venue_name']}**  "
+                            f"&nbsp;·&nbsp;  arrive {t['arrival']}")
+                st.caption(t["sentence"])
+            st.caption(
+                "Every clause above is read from the trace object: ranks from "
+                "the RRF arithmetic, the percentile from the cosine "
+                "decomposition, the words from occlusion, and the scheduling "
+                "reason from the solver's binding record.")
