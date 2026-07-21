@@ -75,7 +75,117 @@ PERSONAS = [
               "more than small talk, and I would rather explore an idea "
               "in depth than rush between attractions."),
         seed_venues=[]),   # filled below
+    # --- expansion wave: p6..p15, added to widen the evaluation sample ---
+    Persona(
+        persona_id="p6_warm_organiser_neworleans",
+        city="New Orleans",
+        text=("I am the one who books the table and makes sure nobody is "
+              "left out. I remember what my friends like and I choose "
+              "places where they will feel looked after. Warm staff matter "
+              "more to me than a clever menu. I set the plan a week ahead, "
+              "send everyone the times, and I feel genuinely happy when the "
+              "whole group is together and comfortable."),
+        day="fri", start_min=11 * 60, end_min=21 * 60),
+    Persona(
+        persona_id="p7_seeded_dutiful_edmonton",
+        city="Edmonton",
+        text=("I go to the same three places and I see no reason to change "
+              "that. I check the opening hours before I leave, I arrive "
+              "early, and I keep the receipt. What I want is clean tables, "
+              "the order correct, and the price the same as last month. I "
+              "do not need surprises, I need somewhere dependable that does "
+              "the ordinary things properly."),
+        seed_venues=[], day="tue", start_min=9 * 60, end_min=18 * 60),
+    Persona(
+        persona_id="p8_theorist_saintlouis",
+        city="Saint Louis",
+        text=("What interests me is the underlying system. I will happily "
+              "spend an hour working out why one roaster tastes different "
+              "from another, or how a building was put together. I would "
+              "rather sit alone with a notebook than make conversation. My "
+              "plans stay loose because a better question usually turns up "
+              "halfway through the day."),
+        day="wed", start_min=11 * 60, end_min=20 * 60),
+    Persona(
+        persona_id="p9_thrillseeker_reno",
+        city="Reno",
+        text=("I want action right now. I walk in, size the place up in ten "
+              "seconds, and if it is dull I am already outside looking for "
+              "the next one. Give me a busy floor, something physical to "
+              "do, a bit of risk and a lot of noise. I never plan ahead, I "
+              "just move and things happen."),
+        day="sat", start_min=12 * 60, end_min=22 * 60),
+    Persona(
+        persona_id="p10_seeded_dreamer_santabarbara",
+        city="Santa Barbara",
+        text=("Some places just feel right to me and I cannot fully explain "
+              "why. I like a small shop that somebody clearly built with "
+              "love, a garden where I can sit and think about what matters "
+              "to me. I care that a place has integrity. I drift rather "
+              "than schedule, and the day usually turns into something I "
+              "did not expect."),
+        seed_venues=[], day="sun", start_min=10 * 60, end_min=19 * 60),
+    Persona(
+        persona_id="p11_strategist_boise",
+        city="Boise",
+        text=("I treat a day out like a project. I decide the objective, "
+              "order the stops so nothing is wasted, and I expect the "
+              "places I pick to deliver. Inefficiency irritates me: slow "
+              "service, vague answers, a queue that nobody is managing. I "
+              "make the call quickly, I hold people to it, and I move on to "
+              "the next thing."),
+        day="thu", start_min=9 * 60, end_min=20 * 60),
+    Persona(
+        persona_id="p12_spontaneous_clearwater",
+        city="Clearwater",
+        text=("Life is too short to sit indoors! I love being out with "
+              "people, good food, music playing, sun on the water. I decide "
+              "everything last minute and it always works out. I am not one "
+              "for heavy conversations about the future, I just want today "
+              "to feel good and for everyone around me to be enjoying it "
+              "too."),
+        day="sat", start_min=11 * 60, end_min=22 * 60),
+    Persona(
+        persona_id="p13_seeded_caretaker_metairie",
+        city="Metairie",
+        text=("I usually plan around my family. I know which places are "
+              "quiet enough for my mother, which ones have staff who are "
+              "patient, and I go back to those. I do not need anything new "
+              "or impressive. I would rather be somewhere familiar where "
+              "people are kind and I know exactly what to expect."),
+        seed_venues=[], day="sun", start_min=10 * 60, end_min=18 * 60),
+    Persona(
+        persona_id="p14_planner_saintpetersburg",
+        city="Saint Petersburg",
+        text=("I research before I go anywhere. I read what the place is "
+              "trying to do, decide whether it is actually good at it, and "
+              "build the day around the two or three that pass. I have "
+              "little patience for crowds or for chatting to strangers. A "
+              "long visit to one serious collection beats six shallow "
+              "stops."),
+        day="mon", start_min=10 * 60, end_min=19 * 60),
+    Persona(
+        persona_id="p15_debater_wilmington",
+        city="Wilmington",
+        text=("I love arguing about ideas with people who push back. Take "
+              "me somewhere with an odd concept and I will pull it apart "
+              "over a drink and enjoy every minute. I start five plans and "
+              "finish two, I get restless with routine, and the best days "
+              "are the ones that go sideways into a conversation I did not "
+              "see coming."),
+        day="fri", start_min=12 * 60, end_min=22 * 60),
 ]
+
+# Personas that receive a synthetic visit history. p4 and p5 are the
+# original seeded pair (unchanged); p7, p10 and p13 join them in the
+# expansion wave.
+SEEDED_PERSONA_IDS = frozenset({
+    "p4_seeded_enthusiast_indianapolis",
+    "p5_seeded_analyst_nashville",
+    "p7_seeded_dutiful_edmonton",
+    "p10_seeded_dreamer_santabarbara",
+    "p13_seeded_caretaker_metairie",
+})
 
 
 def assign_seeds(persona: Persona, assets: PlannerAssets, k: int = 5,
@@ -97,7 +207,7 @@ def main(args):
     explainer = MBTIExplainer(device=args.device)
 
     for persona in PERSONAS:
-        if persona.persona_id.startswith(("p4", "p5")):
+        if persona.persona_id in SEEDED_PERSONA_IDS:
             assign_seeds(persona, assets)
         logger.info(f"=== {persona.persona_id} ({persona.city}, "
                     f"{len(persona.seed_venues)} seeds) ===")

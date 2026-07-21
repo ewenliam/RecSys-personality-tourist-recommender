@@ -22,6 +22,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Thesis-wide figure style (supervisor feedback): thick lines, large fonts
+# on axes and legends, and semantic colors (green = good, red = bad).
+plt.rcParams.update({
+    "font.size": 14, "axes.labelsize": 15, "axes.titlesize": 15,
+    "xtick.labelsize": 13, "ytick.labelsize": 13, "legend.fontsize": 12,
+    "lines.linewidth": 2.5, "lines.markersize": 8, "axes.linewidth": 1.2,
+})
+GOOD, BAD, NEUT, ACC = "#2e7d32", "#c62828", "#9e9e9e", "#1565c0"
+
 PROJECT_ROOT = Path(__file__).parent.parent
 RESULTS = PROJECT_ROOT / "results"
 OUT = PROJECT_ROOT / "docs" / "thesis"
@@ -50,7 +59,8 @@ PRETTY = {
     "KNN-only": "Content (KNN) only",
     "KNN+pop (no GNN)": "Content + popularity",
     "RRF-Hybrid (no pop)": "Hybrid KNN+GNN (no pop.)",
-    "RRF-Hybrid (pop=0.01)": "Hybrid KNN+GNN (+pop.)",
+    "Full minus GNN (KNN+MBTI+pop)": "Full minus graph",
+    "RRF-Hybrid (pop=0.01)": "Full minus personality",
     "Full (KNN+GNN+MBTI+pop)": "Full (all four signals)",
 }
 ORDER = list(PRETTY.keys())
@@ -162,14 +172,16 @@ def latex_methodology_table():
 def fig_classifier(agg=None):
     x = np.arange(len(CLF_DIMS))
     w = 0.38
-    fig, ax = plt.subplots(figsize=(6, 3.4))
-    ax.bar(x - w/2, CLF_BEFORE_BAL, w, label="Before (leaky split)", color="#b4b2a9")
-    ax.bar(x + w/2, CLF_AFTER_BAL, w, label="After (honest, fixed)", color="#534AB7")
-    ax.axhline(0.5, ls="--", lw=0.8, color="#888780", label="Random (0.5)")
-    ax.set_xticks(x); ax.set_xticklabels(CLF_DIMS)
-    ax.set_ylabel("Balanced accuracy"); ax.set_ylim(0, 1.0)
-    ax.set_title("MBTI per-dimension balanced accuracy: before vs after")
-    ax.legend(frameon=False, fontsize=8)
+    fig, ax = plt.subplots(figsize=(7.5, 4.2))
+    ax.bar(x - w/2, CLF_BEFORE_BAL, w, label="Before (leaky split)", color=BAD)
+    ax.bar(x + w/2, CLF_AFTER_BAL, w, label="After (honest, fixed)", color=GOOD)
+    ax.axhline(0.5, ls="--", lw=1.8, color=NEUT, label="Random baseline (0.5)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(CLF_DIMS)
+    ax.set_xlabel("MBTI dimension")
+    ax.set_ylabel("Balanced accuracy")
+    ax.set_ylim(0, 1.0)
+    ax.legend(frameon=False, loc="upper left")
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     fig.tight_layout()
@@ -178,18 +190,29 @@ def fig_classifier(agg=None):
     plt.close(fig)
 
 
+# Short x-axis labels for the model comparison (full names in the text).
+ABBREV = {"Popularity": "POP", "GNN-only": "GNN", "MBTI-only": "MBTI",
+          "KNN-only": "CNT", "KNN+pop (no GNN)": "CNT+P",
+          "RRF-Hybrid (no pop)": "HYB",
+          "Full minus GNN (KNN+MBTI+pop)": "-GNN",
+          "RRF-Hybrid (pop=0.01)": "-MBTI",
+          "Full (KNN+GNN+MBTI+pop)": "FULL"}
+
+
 def fig_recommender(agg, k=10):
     sub = agg[agg["K"] == k].set_index("Model").reindex(ORDER)
-    labels = [PRETTY[m] for m in ORDER]
+    labels = [ABBREV[m] for m in ORDER]
     x = np.arange(len(ORDER))
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig, ax = plt.subplots(figsize=(8.5, 4.5))
     hr = sub["Hit Rate@K_mean"].values
     hr_e = sub["Hit Rate@K_std"].values
-    colors = ["#b4b2a9"] * (len(ORDER) - 1) + ["#534AB7"]
-    ax.bar(x, hr, yerr=hr_e, capsize=3, color=colors)
-    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+    colors = [BAD] + [NEUT] * (len(ORDER) - 2) + [GOOD]
+    ax.bar(x, hr, yerr=hr_e, capsize=5,
+           error_kw={"elinewidth": 2, "capthick": 2}, color=colors)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("Model (abbreviations defined in the text)")
     ax.set_ylabel(f"Hit Rate@{k}")
-    ax.set_title(f"Hit Rate@{k} by model (mean $\\pm$ std, 5 seeds)")
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     fig.tight_layout()
@@ -205,14 +228,15 @@ def fig_ablation(agg, k=10):
     chain_lbl = ["Popularity", "+Content", "+GNN", "+Popularity", "+MBTI (Full)"]
     sub = agg[agg["K"] == k].set_index("Model")
     ndcg = [sub.loc[m, "NDCG@K_mean"] for m in chain]
-    fig, ax = plt.subplots(figsize=(6.5, 3.6))
-    ax.plot(range(len(chain)), ndcg, "-o", color="#1D9E75", lw=2)
-    ax.set_xticks(range(len(chain))); ax.set_xticklabels(chain_lbl, rotation=20, ha="right", fontsize=8)
+    fig, ax = plt.subplots(figsize=(8, 4.4))
+    ax.plot(range(len(chain)), ndcg, "-o", color=GOOD)
+    ax.set_xticks(range(len(chain)))
+    ax.set_xticklabels(chain_lbl, rotation=15, ha="right")
+    ax.set_xlabel("Signals added to the fusion (left to right)")
     ax.set_ylabel(f"NDCG@{k}")
-    ax.set_title("Incremental contribution of each signal")
     for i, v in enumerate(ndcg):
         ax.annotate(f"{v:.4f}", (i, v), textcoords="offset points",
-                    xytext=(0, 7), ha="center", fontsize=7)
+                    xytext=(0, 10), ha="center", fontsize=11)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     fig.tight_layout()

@@ -41,7 +41,9 @@ class PlannerAssets:
         """Venue indices in a city; optionally only those with known hours."""
         mask = (self.venue_meta["city"].str.lower() == city.lower()).to_numpy()
         if require_hours:
-            mask &= self.venue_geo["has_hours"].to_numpy()
+            # pandas 3 returns read-only arrays from to_numpy(), so combine
+            # into a new array rather than updating mask in place.
+            mask = mask & self.venue_geo["has_hours"].to_numpy()
         return np.where(mask)[0]
 
     def visitors_of(self, venue_idx: int) -> np.ndarray:

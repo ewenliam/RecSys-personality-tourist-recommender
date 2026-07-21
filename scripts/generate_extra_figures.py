@@ -26,10 +26,14 @@ FIGDIR = PROJECT_ROOT / "docs" / "thesis" / "figures"
 FIGDIR.mkdir(parents=True, exist_ok=True)
 
 plt.rcParams.update({
-    "figure.dpi": 150, "font.size": 10, "axes.grid": True,
+    "figure.dpi": 150, "font.size": 14, "axes.grid": True,
     "grid.alpha": 0.3, "axes.spines.top": False, "axes.spines.right": False,
+    "axes.labelsize": 15, "xtick.labelsize": 13, "ytick.labelsize": 13,
+    "legend.fontsize": 12, "lines.linewidth": 2.5, "lines.markersize": 8,
+    "axes.linewidth": 1.2,
 })
-BLUE, ORANGE, GRAY = "#1f77b4", "#ff7f0e", "#8c8c8c"
+BLUE, ORANGE, GRAY = "#1565c0", "#e65100", "#9e9e9e"
+GOOD, BAD = "#2e7d32", "#c62828"
 
 
 def save(fig, name):
@@ -152,28 +156,30 @@ def result_figures():
     ax.set_ylabel("Validation accuracy (per post)")
     save(fig, "fig_training_curve")
 
-    # Backbone ablation with bert seed spread.
-    fig, ax = plt.subplots(figsize=(6, 3))
+    # Backbone ablation with bert seed spread. The canonical configuration
+    # (bert-base/128) is green; the tested alternatives are neutral grey.
+    fig, ax = plt.subplots(figsize=(8, 4.2))
     names = ["bert-base\n128", "roberta-base\n256", "deberta-v3\n128",
              "deberta-v3\n256"]
     vals = [0.752, 0.740, 0.743, 0.761]
     ax.axhspan(0.742, 0.772, color=GRAY, alpha=0.25,
-               label="bert seed spread (3 seeds)")
-    ax.bar(names, vals, color=[BLUE, ORANGE, ORANGE, ORANGE], width=0.55)
+               label="bert-base seed spread (3 seeds)")
+    ax.bar(names, vals, color=[GOOD, GRAY, GRAY, GRAY], width=0.55)
     for i, v in enumerate(vals):
-        ax.text(i, v + 0.002, f"{v:.3f}", ha="center", fontsize=9)
+        ax.text(i, v + 0.002, f"{v:.3f}", ha="center", fontsize=12)
     ax.set_ylim(0.70, 0.79)
+    ax.set_xlabel("Backbone / context length (tokens)")
     ax.set_ylabel("Balanced accuracy (per user)")
-    ax.legend(loc="upper left", fontsize=8)
+    ax.legend(loc="upper left")
     save(fig, "fig_backbone_ablation")
 
     # K sensitivity + per-seed variance from the robustness CSVs.
     agg_path = RESULTS / "phase4_robustness_agg.csv"
     if agg_path.exists():
         agg = pd.read_csv(agg_path)
-        models = {"Popularity": GRAY, "KNN-only": ORANGE,
-                  "Full (KNN+GNN+MBTI+pop)": BLUE}
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 3))
+        models = {"Popularity": BAD, "KNN-only": BLUE,
+                  "Full (KNN+GNN+MBTI+pop)": GOOD}
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
         for m, c in models.items():
             sub = agg[agg["Model"] == m].sort_values("K")
             label = "Full hybrid" if m.startswith("Full") else (
@@ -199,14 +205,16 @@ def result_figures():
                  "RRF-Hybrid (pop=0.01)", "Full (KNN+GNN+MBTI+pop)"]
         pretty = ["Popularity", "GNN only", "MBTI only", "Content only",
                   "Hybrid (no MBTI)", "Full hybrid"]
-        fig, ax = plt.subplots(figsize=(6.5, 3.2))
+        fig, ax = plt.subplots(figsize=(8.5, 4.2))
         for i, m in enumerate(order):
             vals = k10[k10["Model"] == m]["Hit Rate@K"]
-            ax.scatter([i] * len(vals), vals, color=BLUE, alpha=0.65, s=28)
-            ax.scatter([i], [vals.mean()], color=ORANGE, marker="_",
-                       s=500, lw=2)
+            ax.scatter([i] * len(vals), vals, color="#455a64", alpha=0.7,
+                       s=55, label="single seed" if i == 0 else None)
+            ax.scatter([i], [vals.mean()], color=GOOD, marker="_",
+                       s=700, lw=3.5, label="mean of 5 seeds" if i == 0 else None)
         ax.set_xticks(range(len(order)), pretty, rotation=20, ha="right")
         ax.set_ylabel("Hit Rate@10")
+        ax.legend(loc="upper left")
         save(fig, "fig_seed_variance")
 
 

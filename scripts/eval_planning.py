@@ -29,7 +29,7 @@ from src.planner.candidates import candidate_set
 from src.planner.orienteering import plan_itinerary, haversine_min
 from src.explain.text_attrib import MBTIExplainer
 from src.utils.helpers import setup_logging
-from scripts.run_itineraries import PERSONAS, assign_seeds
+from scripts.run_itineraries import PERSONAS, SEEDED_PERSONA_IDS, assign_seeds
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def main(args):
 
     rows = []
     for persona in PERSONAS:
-        if persona.persona_id.startswith(("p4", "p5")):
+        if persona.persona_id in SEEDED_PERSONA_IDS:
             assign_seeds(persona, assets)
         m_vec, _ = explainer.embed(persona.text, assets.mbti_center)
         cands = candidate_set(persona, assets, m_vec, top_n=50)
