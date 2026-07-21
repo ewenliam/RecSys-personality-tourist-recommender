@@ -198,7 +198,9 @@ class HeteroGNNTrainer:
 
         Instead, we run num_grad_steps full-graph forward passes, each using
         a different random edge sample for BPR loss.  With 1 SAGEConv layer,
-        each pass takes ~2-3 s on this GPU, so 200 steps ≈ 7 min/epoch.
+        each pass takes ~0.16 s on the RTX 4060 Laptop, so 200 steps is about
+        33 s/epoch (measured 2026-07-21; an earlier comment here claimed
+        ~7 min/epoch, which no longer matches the code).
         This is far cheaper than the old approach (1 full pass per mini-batch
         = 3,750 passes × 5 negatives = 18,750 passes per epoch).
 

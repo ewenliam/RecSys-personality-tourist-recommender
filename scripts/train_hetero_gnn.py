@@ -251,13 +251,45 @@ def main(args):
         "venue": builder.nodes["venue"].features,
     }
 
-    # Collect all edge types (for message passing)
+    # Split edges FIRST, so message passing can be restricted to them.
+    train_edges, val_edges, test_edges = split_edges(builder)
+
+    # LEAKAGE FIX: message passing must see ONLY training interactions.
+    # Propagating over held-out edges lets a user embedding aggregate the
+    # very venues the evaluation later asks the model to predict, which
+    # inflates every downstream ranking metric. The user-venue edges (and
+    # their reverse) are therefore replaced by the training split; other
+    # edge types are content-side and carry no interaction label.
     edge_index_dict = {}
     for edge_type, edge_data in builder.edges.items():
-        edge_index_dict[edge_type] = edge_data.edge_index
+        if edge_type == HeteroGraphBuilder.USER_VISITS_VENUE:
+            edge_index_dict[edge_type] = train_edges
+        elif edge_type == HeteroGraphBuilder.VENUE_REV_VISITS:
+            edge_index_dict[edge_type] = train_edges.flip(0)
+        else:
+            edge_index_dict[edge_type] = edge_data.edge_index
 
-    # Split edges
-    train_edges, val_edges, test_edges = split_edges(builder)
+    n_all = builder.edges[HeteroGraphBuilder.USER_VISITS_VENUE].edge_index.size(1)
+    logger.info(
+        f"Message passing restricted to {train_edges.size(1)} training edges "
+        f"of {n_all} total ({train_edges.size(1) / n_all:.1%}); "
+        f"{n_all - train_edges.size(1)} held-out edges excluded from propagation"
+    )
+
+    # Persist the split so scripts/evaluate_hybrid.py can evaluate on exactly
+    # the edges this model never saw, in the same (GNN) index space.
+    split_path = MODEL_DIR / "gnn_hetero" / "split_edges.npz"
+    split_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_edges = torch.cat([val_edges, test_edges], dim=1)
+    np.savez(
+        split_path,
+        train_edges=train_edges.cpu().numpy().astype(np.int64),
+        eval_edges=eval_edges.cpu().numpy().astype(np.int64),
+    )
+    logger.info(
+        f"Saved split to {split_path} "
+        f"(train={train_edges.size(1)}, eval={eval_edges.size(1)})"
+    )
 
     # Determine input dimensions
     node_input_dims = {

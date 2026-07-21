@@ -374,6 +374,8 @@ def run_popularity_evaluation(
     venue_embeddings: np.ndarray,
     k_values: list[int],
     num_eval_users: int = 200,
+    eval_users: list = None,
+    per_user_out: dict = None,
 ) -> tuple[pd.DataFrame, PopularityRanker]:
     """Evaluate the non-personalised popularity baseline."""
     logger.info("[Popularity] Computing popularity-ranked recommendations...")
@@ -383,6 +385,7 @@ def run_popularity_evaluation(
         ranker, user_embeddings, venue_embeddings,
         user_gt, k_values,
         num_eval_users=num_eval_users,
+        eval_users=eval_users, per_user_out=per_user_out,
     )
     metrics["Model"] = "Popularity"
     return metrics, ranker
@@ -499,6 +502,40 @@ def load_interactions(data_dir: Path) -> tuple[pd.DataFrame, str, str]:
     return df, user_col, biz_col
 
 
+def _user_gt_from(test_edges: np.ndarray) -> dict:
+    """Ground truth per user: user_idx -> set of held-out venue_idx."""
+    user_gt: dict = {}
+    for i in range(test_edges.shape[1]):
+        u, v = int(test_edges[0, i]), int(test_edges[1, i])
+        user_gt.setdefault(u, set()).add(v)
+    return user_gt
+
+
+def load_gnn_split(model_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Load the exact split the GNN was trained with.
+
+    The graph encoder propagates over training edges only, so evaluating on
+    the edges it never saw is what makes the collaborative signal honest.
+    Both arrays are already in the GNN index space, which is the same space
+    used everywhere downstream (see id_mappings.pt).
+    """
+    path = model_dir / "gnn_hetero" / "split_edges.npz"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Retrain the graph encoder "
+            "(python scripts/train_hetero_gnn.py) to regenerate it, or pass "
+            "--split random to reproduce the older, leakage-prone protocol."
+        )
+    data = np.load(path)
+    train_edges, test_edges = data["train_edges"], data["eval_edges"]
+    logger.info(
+        f"Loaded GNN split: train={train_edges.shape[1]}, "
+        f"test={test_edges.shape[1]} (edges the encoder never propagated over)"
+    )
+    return train_edges, test_edges, _user_gt_from(test_edges)
+
+
 def create_train_test_edges(
     interactions: pd.DataFrame,
     user_col: str,
@@ -507,7 +544,13 @@ def create_train_test_edges(
     venue_id_map: dict,
     test_ratio: float = 0.2,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Create edge arrays with train/test split."""
+    """
+    Random interaction split (legacy protocol, kept for comparison).
+
+    WARNING: this split is independent of the one the graph encoder was
+    trained with, so held-out edges here may have been inside the encoder's
+    message-passing graph. Prefer load_gnn_split().
+    """
     # Filter to mapped users and venues
     valid = interactions[
         interactions[user_col].isin(user_id_map) &
@@ -527,13 +570,7 @@ def create_train_test_edges(
     train_edges = edges[:, perm[n_test:]]
     test_edges = edges[:, perm[:n_test]]
 
-    # Build ground truth per user
-    user_gt = {}
-    for i in range(test_edges.shape[1]):
-        u, v = int(test_edges[0, i]), int(test_edges[1, i])
-        if u not in user_gt:
-            user_gt[u] = set()
-        user_gt[u].add(v)
+    user_gt = _user_gt_from(test_edges)
 
     logger.info(f"Train edges: {train_edges.shape[1]}, Test edges: {test_edges.shape[1]}")
     return train_edges, test_edges, user_gt
@@ -550,6 +587,8 @@ def evaluate_recommendations(
     user_mbti: np.ndarray = None,
     venue_mbti: np.ndarray = None,
     num_eval_users: int = 200,
+    eval_users: list = None,
+    per_user_out: dict = None,
 ) -> pd.DataFrame:
     """
     Evaluate recommendation quality with ranking metrics.
@@ -565,16 +604,23 @@ def evaluate_recommendations(
         k_values: List of K values for metrics.
         user_extra: Extra user features (MBTI embeddings for RRF).
         venue_extra: Extra venue features (BERTopic PCA for RRF).
-        num_eval_users: Number of users to evaluate.
+        num_eval_users: Number of users to sample if eval_users is not given.
+        eval_users: Explicit list of user indices to evaluate. When supplied,
+            every model is scored on the SAME users, which pairs the
+            comparison and removes user-sampling variance between models.
+        per_user_out: Optional dict; if given, filled with
+            {user_idx: metric_value} at K=10 for a paired significance test.
 
     Returns:
         DataFrame with metrics per K.
     """
     calc = RecommendationMetrics()
 
-    eval_users = list(user_gt.keys())
-    if len(eval_users) > num_eval_users:
-        eval_users = list(np.random.choice(eval_users, num_eval_users, replace=False))
+    if eval_users is None:
+        eval_users = list(user_gt.keys())
+        if len(eval_users) > num_eval_users:
+            eval_users = list(np.random.choice(
+                eval_users, num_eval_users, replace=False))
 
     results = {k: {"precision": [], "recall": [], "ndcg": [], "mrr": [], "hit_rate": []}
                for k in k_values}
@@ -605,6 +651,9 @@ def evaluate_recommendations(
             results[k]["mrr"].append(calc.mrr(recs, gt))
             results[k]["hit_rate"].append(calc.hit_rate_at_k(recs, gt, k))
 
+        if per_user_out is not None:
+            per_user_out[user_idx] = calc.ndcg_at_k(recs, gt, 10)
+
     rows = []
     for k in k_values:
         rows.append({
@@ -634,6 +683,8 @@ def run_rrf_evaluation(
     user_mbti: np.ndarray = None,
     venue_mbti: np.ndarray = None,
     num_eval_users: int = 200,
+    eval_users: list = None,
+    per_user_out: dict = None,
 ) -> tuple[pd.DataFrame, RRFRanker]:
     """
     Evaluate the Reciprocal Rank Fusion hybrid recommender.
@@ -703,6 +754,7 @@ def run_rrf_evaluation(
         user_mbti=user_mbti,
         venue_mbti=venue_mbti,
         num_eval_users=num_eval_users,
+        eval_users=eval_users, per_user_out=per_user_out,
     )
     metrics["Model"] = label
 
@@ -928,12 +980,17 @@ def main(args):
         venue_embeddings=venue_embs_for_scorer,
     )
 
-    # Create train/test split
-    train_edges, test_edges, user_gt = create_train_test_edges(
-        interactions, user_col, biz_col,
-        user_id_map, venue_id_map,
-        test_ratio=0.2,
-    )
+    # Create train/test split. The default reuses the graph encoder's own
+    # split so that every evaluated edge is one the encoder never propagated
+    # over. Passing --split random reproduces the older protocol.
+    if args.split == "gnn":
+        train_edges, test_edges, user_gt = load_gnn_split(MODEL_DIR)
+    else:
+        train_edges, test_edges, user_gt = create_train_test_edges(
+            interactions, user_col, biz_col,
+            user_id_map, venue_id_map,
+            test_ratio=0.2,
+        )
 
     # Compute personality features for all users
     all_user_indices = np.arange(n_users)
@@ -1026,6 +1083,23 @@ def main(args):
     # Number of eval users: quick mode uses 100, full uses 500
     num_eval_users = 100 if args.quick else 500
 
+    # PAIRED EVALUATION: sample the evaluation users ONCE and score every
+    # model on the same set. Previously each model drew its own random
+    # sample inside evaluate_recommendations, so the seed-to-seed spread of a
+    # model and the between-model gaps were both contaminated by which users
+    # happened to be drawn. Sampling once removes that variance and makes the
+    # ablations a paired comparison, which is the correct design.
+    _pool = [u for u in user_gt if user_gt[u]]
+    if len(_pool) > num_eval_users:
+        eval_users = list(np.random.choice(
+            _pool, num_eval_users, replace=False))
+    else:
+        eval_users = _pool
+    logger.info(f"Paired evaluation on {len(eval_users)} shared users")
+    # Per-user NDCG@10, collected for the models entering the significance
+    # test (full, full-minus-graph, full-minus-personality, popularity).
+    per_user = {}
+
     # Build BERTopic user profiles from training interactions.
     # The GNN embeddings have collapsed to near-uniform representations
     # (cosine std ~0.025, min ~0.74) on this dataset, making them
@@ -1053,11 +1127,14 @@ def main(args):
     logger.info("Baseline: Popularity (non-personalised)")
     logger.info("=" * 60)
 
+    per_user["Popularity"] = {}
     pop_baseline_metrics, _ = run_popularity_evaluation(
         train_edges, user_gt,
         user_embeddings, venue_embeddings,
         k_values,
         num_eval_users=num_eval_users,
+        eval_users=eval_users,
+        per_user_out=per_user["Popularity"],
     )
 
     # ---------------------------------------------------------------
@@ -1078,6 +1155,7 @@ def main(args):
         user_extra=knn_user_embs,
         venue_extra=bertopic_venue_embs,
         num_eval_users=num_eval_users,
+        eval_users=eval_users,
     )
 
     # ---------------------------------------------------------------
@@ -1087,6 +1165,7 @@ def main(args):
     logger.info(f"RRF: KNN + GNN + popularity tiebreaker (alpha={args.pop_alpha})")
     logger.info("=" * 60)
 
+    per_user["RRF-Hybrid (pop=0.01)"] = {}
     rrf_pop_metrics, rrf_pop_ranker = run_rrf_evaluation(
         train_edges, user_gt,
         user_embeddings, venue_embeddings,
@@ -1098,6 +1177,8 @@ def main(args):
         user_extra=knn_user_embs,
         venue_extra=bertopic_venue_embs,
         num_eval_users=num_eval_users,
+        eval_users=eval_users,
+        per_user_out=per_user["RRF-Hybrid (pop=0.01)"],
     )
 
     # ---------------------------------------------------------------
@@ -1118,6 +1199,7 @@ def main(args):
         user_extra=knn_user_embs,
         venue_extra=bertopic_venue_embs,
         num_eval_users=num_eval_users,
+        eval_users=eval_users,
     )
 
     # ---------------------------------------------------------------
@@ -1138,6 +1220,7 @@ def main(args):
         user_extra=None,
         venue_extra=None,
         num_eval_users=num_eval_users,
+        eval_users=eval_users,
     )
 
     # ---------------------------------------------------------------
@@ -1161,12 +1244,14 @@ def main(args):
         user_extra=knn_user_embs,
         venue_extra=bertopic_venue_embs,
         num_eval_users=num_eval_users,
+        eval_users=eval_users,
     )
 
     # ---------------------------------------------------------------
     # Ablation 4: MBTI only (personality from the user's own writing)
     # ---------------------------------------------------------------
     mbti_metrics = None
+    no_gnn_metrics = None
     full_metrics = None
     if user_mbti_embs is not None and venue_mbti_embs is not None:
         logger.info("=" * 60)
@@ -1184,6 +1269,7 @@ def main(args):
             user_mbti=user_mbti_embs,
             venue_mbti=venue_mbti_embs,
             num_eval_users=num_eval_users,
+            eval_users=eval_users,
         )
 
         # -----------------------------------------------------------
@@ -1194,6 +1280,7 @@ def main(args):
         logger.info(f"FULL: KNN + GNN + MBTI + pop (alpha={args.pop_alpha})")
         logger.info("=" * 60)
 
+        per_user["Full (KNN+GNN+MBTI+pop)"] = {}
         full_metrics, _ = run_rrf_evaluation(
             train_edges, user_gt,
             user_embeddings, venue_embeddings,
@@ -1207,6 +1294,38 @@ def main(args):
             user_mbti=user_mbti_embs,
             venue_mbti=venue_mbti_embs,
             num_eval_users=num_eval_users,
+            eval_users=eval_users,
+            per_user_out=per_user["Full (KNN+GNN+MBTI+pop)"],
+        )
+
+        # -----------------------------------------------------------
+        # Leave-one-out: the full hybrid WITHOUT the graph signal.
+        # Together with "Full minus MBTI" (= RRF-Hybrid pop) this makes the
+        # ablation symmetric, so each signal's contribution is measured by
+        # removing it from the complete system rather than by adding it to a
+        # weaker one.
+        # -----------------------------------------------------------
+        logger.info("=" * 60)
+        logger.info(f"Ablation: Full minus GNN (KNN+MBTI+pop, "
+                    f"alpha={args.pop_alpha})")
+        logger.info("=" * 60)
+
+        per_user["Full minus GNN (KNN+MBTI+pop)"] = {}
+        no_gnn_metrics, _ = run_rrf_evaluation(
+            train_edges, user_gt,
+            user_embeddings, venue_embeddings,
+            k_values,
+            label="Full minus GNN (KNN+MBTI+pop)",
+            rrf_mode="knn+mbti",
+            rrf_k=args.rrf_k,
+            popularity_alpha=args.pop_alpha,
+            user_extra=knn_user_embs,
+            venue_extra=bertopic_venue_embs,
+            user_mbti=user_mbti_embs,
+            venue_mbti=venue_mbti_embs,
+            num_eval_users=num_eval_users,
+            eval_users=eval_users,
+            per_user_out=per_user["Full minus GNN (KNN+MBTI+pop)"],
         )
 
     # ---------------------------------------------------------------
@@ -1220,6 +1339,8 @@ def main(args):
         metric_frames.append(mbti_metrics)
     if full_metrics is not None:
         metric_frames.append(full_metrics)
+    if no_gnn_metrics is not None:
+        metric_frames.append(no_gnn_metrics)
     all_metrics = pd.concat(metric_frames, ignore_index=True)
 
     logger.info("\n" + "=" * 80)
@@ -1254,6 +1375,47 @@ def main(args):
     latex_path = RESULTS_DIR / "phase4_methodology_comparison.tex"
     latex_path.write_text(latex_str, encoding="utf-8")
 
+    # Paired significance tests on per-user NDCG@10. Because every model was
+    # scored on the SAME users (paired evaluation), a Wilcoxon signed-rank
+    # test over the shared users has n on the order of 500, unlike a
+    # seed-level test which is limited to n=5. We test the full hybrid
+    # against each leave-one-out ablation and against popularity.
+    full_key = "Full (KNN+GNN+MBTI+pop)"
+    if per_user.get(full_key):
+        from scipy.stats import wilcoxon
+        rows = []
+        base = per_user[full_key]
+        shared_ref = set(base)
+        for other in ["Full minus GNN (KNN+MBTI+pop)",
+                      "RRF-Hybrid (pop=0.01)", "Popularity"]:
+            comp = per_user.get(other, {})
+            common = sorted(shared_ref & set(comp))
+            a = np.array([base[u] for u in common])
+            b = np.array([comp[u] for u in common])
+            diff = a - b
+            if np.any(diff != 0):
+                stat, pval = wilcoxon(a, b)
+            else:
+                stat, pval = float("nan"), 1.0
+            rows.append({
+                "comparison": f"full_vs_{other}",
+                "metric": "NDCG@10",
+                "n_users": len(common),
+                "mean_full": float(a.mean()),
+                "mean_other": float(b.mean()),
+                "mean_diff": float(diff.mean()),
+                "wins_full": int((diff > 0).sum()),
+                "wins_other": int((diff < 0).sum()),
+                "ties": int((diff == 0).sum()),
+                "wilcoxon_p": float(pval),
+                "seed": args.seed,
+            })
+            logger.info(f"  {full_key} vs {other}: n={len(common)}, "
+                        f"mean diff {diff.mean():+.5f}, p={pval:.4g}")
+        sig_out = RESULTS_DIR / f"significance_seed{args.seed}.csv"
+        pd.DataFrame(rows).to_csv(sig_out, index=False)
+        logger.info(f"Saved paired significance tests to {sig_out}")
+
     logger.info(f"\nResults saved to {RESULTS_DIR}")
     logger.info("Done.")
 
@@ -1281,6 +1443,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed for user sampling (default 42)",
+    )
+    parser.add_argument(
+        "--split", type=str, default="gnn", choices=["gnn", "random"],
+        help="Evaluation split. 'gnn' (default) reuses the graph encoder's "
+             "held-out edges, so no evaluated edge was in its message-passing "
+             "graph. 'random' reproduces the older, leakage-prone protocol.",
     )
     parser.add_argument(
         "--out", type=str, default=None,

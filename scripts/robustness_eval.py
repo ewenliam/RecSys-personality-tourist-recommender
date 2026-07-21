@@ -3,13 +3,17 @@
 Robustness check: run the hybrid evaluation across several random seeds and
 report mean +/- std for every model and metric.
 
-The only thing a seed changes is WHICH test users are sampled, so the spread
-across seeds tells us whether the model ranking (especially the full hybrid's
-lead) is stable or a sampling artifact.
+Under the default (--split gnn) the interaction split is fixed, loaded from
+the graph encoder's own held-out edges, so the only thing a seed changes is
+WHICH test users are sampled. The spread across seeds therefore isolates
+sampling noise. Note this was NOT true of the older --split random protocol,
+where set_seed() ran before the split was drawn and each seed silently
+resampled the interaction split as well.
 
 Usage:
     python scripts/robustness_eval.py
     python scripts/robustness_eval.py --seeds 42,123,7,2024,99
+    python scripts/robustness_eval.py --split random   # legacy protocol
 """
 import argparse
 import subprocess
@@ -26,13 +30,14 @@ SEED_DIR = RESULTS_DIR / "_robustness"
 METRIC_COLS = ["Precision@K", "Recall@K", "NDCG@K", "MRR", "Hit Rate@K"]
 MODEL_ORDER = [
     "Popularity", "GNN-only", "MBTI-only", "KNN-only", "KNN+pop (no GNN)",
-    "RRF-Hybrid (no pop)", "RRF-Hybrid (pop=0.01)", "Full (KNN+GNN+MBTI+pop)",
+    "RRF-Hybrid (no pop)", "Full minus GNN (KNN+MBTI+pop)",
+    "RRF-Hybrid (pop=0.01)", "Full (KNN+GNN+MBTI+pop)",
 ]
 
 
-def run_seed(seed: int) -> pd.DataFrame:
+def run_seed(seed: int, split: str = "gnn") -> pd.DataFrame:
     """Run evaluate_hybrid.py for one seed and load its metrics CSV."""
-    out_path = SEED_DIR / f"seed_{seed}.csv"
+    out_path = SEED_DIR / f"seed_{seed}_{split}.csv"
     if out_path.exists():
         print(f"[seed {seed}] cached -> {out_path}")
         return pd.read_csv(out_path)
@@ -40,7 +45,7 @@ def run_seed(seed: int) -> pd.DataFrame:
     print(f"[seed {seed}] running evaluate_hybrid.py ...")
     cmd = [
         sys.executable, str(PROJECT_ROOT / "scripts" / "evaluate_hybrid.py"),
-        "--seed", str(seed), "--out", str(out_path),
+        "--seed", str(seed), "--out", str(out_path), "--split", split,
     ]
     result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
     if result.returncode != 0 or not out_path.exists():
@@ -52,7 +57,7 @@ def main(args):
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     SEED_DIR.mkdir(parents=True, exist_ok=True)
 
-    frames = [run_seed(s) for s in seeds]
+    frames = [run_seed(s, args.split) for s in seeds]
     raw = pd.concat(frames, ignore_index=True)
     raw.to_csv(RESULTS_DIR / "phase4_robustness_per_seed.csv", index=False)
 
@@ -117,5 +122,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-seed robustness check")
     parser.add_argument("--seeds", type=str, default="42,123,7,2024,99")
     parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--split", type=str, default="gnn",
+                        choices=["gnn", "random"],
+                        help="Passed through to evaluate_hybrid.py. Cached "
+                             "per-seed results are keyed by split, so the two "
+                             "protocols never overwrite each other.")
     args = parser.parse_args()
     main(args)
