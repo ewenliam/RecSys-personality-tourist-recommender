@@ -1,196 +1,116 @@
-Enhancing on Creating Profiles for a Tourist Recommendation System Based on  
-User-generated POI Datasets Thesis 
+# Personality-Aware Tourist Venue Recommender
 
-Summary of the paper: 
-The primary objective of the thesis is to develop a more personalized tourist 
-recommendation system by integrating user and venue personalities (using the 
-Myers-Briggs Type Indicator, MBTI) and topic modeling (via BERTopic) into the 
-recommendation process. 
+MSc thesis project (Warsaw University of Technology). A tourist venue
+recommender that infers user personality (MBTI) from review text and fuses it
+with content, collaborative, and popularity signals. It extends and corrects an
+earlier MSc thesis on the same task: the prior work's headline MBTI accuracy
+(~94%) was inflated by data leakage, and the honest replication is the core
+contribution.
 
-The thesis concludes that: 
-● Personality-based and topic-driven features significantly improve recommendation 
-accuracy compared to traditional methods (e.g., collaborative filtering). 
-● BERT and BERTopic are effective for extracting personality traits and topics from 
-unstructured text (user reviews and venue descriptions). 
-● Challenges such as dataset imbalance (e.g., skewed MBTI distributions) were 
-addressed via upsampling, but further data collection is needed for minority 
-personality types. 
-● Frequent closed itemset mining (DCI Closed) helped identify meaningful user-venue 
-interaction patterns, though the system could benefit from hybrid models (e.g., 
-combining with GNNs or multimodal NLP). 
+> This README documents the system **as built**. Several components differ from
+> the original proposal (see history): the classifier uses four binary heads
+> rather than 16-way classification, the graph model is heterogeneous GraphSAGE
+> rather than LTGNN, and the final ranker is parameter-free Reciprocal Rank
+> Fusion rather than an XGBoost learner.
 
-Target Audience: 
-The thesis is primarily academic , targeting researchers and students in the fields of: 
-1. Recommendation systems (especially in tourism and location-based services). 
-2. Natural Language Processing (NLP) , focusing on personality prediction and topic 
-modeling. 
-3. Data mining , particularly in the context of frequent itemset mining and hybrid models. 
-the practical applications also align with businesses in the tourism industry: 
-● Travel platforms 
-● Destination marketing organizations
+## What it does
 
-Expanding Thesis of Recommendation System. 
-● GNN (graph Neural Network (GNNs)  
-(Jiahao Zhang, Rui Xue, Wenqi Fan, Xin Xu, Qing Li, Jian Pei, and Xiaorui 
-Liu. 2024. Linear-Time Graph Neural Networks for Scalable Recommendations. 
-In Proceedings of the ACM Web Conference 2024 (WWW '24). Association for 
-Computing Machinery, New York, NY, USA, 3533–3544. 
-https://doi.org/10.1145/3589334.3645486) 
-GNNs are a class of deep learning models designed to operate on graph-structured 
-data. They generalize neural networks to non-Euclidean domains by propagating 
-information through the edges of a graph to learn node embeddings. In 
-recommendation systems, GNNs can model relationships between users, items 
-(venues), and other entities (e.g., topics, locations, or time). 
-● Reducing Overconfidence in Sequential Recommendation Trained with Negative 
-Sampling (Based on the best paper on RecSys ACM conference 2023) 
+1. **Infers MBTI from text.** A fine-tuned `bert-base-uncased` classifier with
+   four binary heads (E/I, S/N, T/F, J/P) predicts personality from a user's
+   reviews.
+2. **Ranks venues** by fusing four signals with Reciprocal Rank Fusion (RRF):
+   personality-informed content (BERTopic), collaborative (GraphSAGE),
+   direct personality compatibility (visitor-mean venue profiles), and a
+   popularity tie-breaker.
+3. **Plans and explains** (proof of concept). An orienteering solver turns the
+   ranked list into a feasible single-day itinerary, and each stop carries a
+   faithful reasoning trace across the text encoder, graph model, and planner.
 
-WHY: 
-Here we are using Graph Neural Networks (GNNs) to model user-venue interactions. GNNs 
-often rely on sequential or temporal edges (e.g., "user X visited venue Y last week"). 
-However, sequential models (including GNNs) trained with negative sampling can become 
-overconfident: 
-● Issue : GNNs might overemphasize strong patterns (e.g., "users who visit museums 
-also visit historical sites") while ignoring less obvious but valid recommendations. 
-● Solution from the Paper : 
-    ○ Modified Loss Functions : The paper suggests using techniques like 
-    confidence-aware loss or distribution calibration to penalize overconfident 
-    predictions. 
-    ○ Improved Negative Sampling : Better sampling strategies (e.g., harder 
-    negatives) to ensure the model learns nuanced distinctions between relevant 
-    and irrelevant items. 
-● Example : GNN could avoid recommending only "popular museums" for an INTJ user 
-by being less overconfident about their preferences and exploring niche venues. 
+## Headline results (honest, corrected protocol)
 
-HOW: 
-A. Modify Loss Functions 
-● Current Approach : GNN/XGBoost models likely use standard loss functions (e.g., 
-cross-entropy). 
-● Enhancement : 
-Implement confidence-aware loss (as in the paper) to penalize overconfident 
-predictions. For example: 
-Loss=CrossEntropy+λ⋅ConfidencePenalty(p) 
-where p is the prediction confidence and λ balances the penalty. 
-● Impact : Reduces overconfidence in GNN embeddings and XGBoost scores. 
+- **Classifier** (user-disjoint split, per-user majority vote): 80.1% accuracy,
+  75.2% balanced accuracy, 44.5% exact 16-type. The prior work's ~94% was a
+  leakage artefact.
+- **Backbone ablation**: BERT, RoBERTa, and DeBERTa-v3 all land within
+  0.74-0.76 balanced accuracy. The dataset, not model capacity, is the ceiling.
+- **Recommender** (5 seeds, paired evaluation, K=10): the full four-signal
+  hybrid is best on every metric (Hit Rate@10 0.038, ~91x a random ranker) and
+  wins on all or nearly all seeds. A paired Wilcoxon test finds the personality
+  signal a significant contributor; the graph signal and the margin over a
+  popularity baseline are positive but not robustly significant.
 
-B. Improve Negative Sampling 
-● Current Approach : DCI Closed itemset mining and BERTopic might rely on basic 
-negative sampling (e.g., random negatives). 
-● Enhancement : 
-Use hard negative mining (as in the paper) to select negatives that are semantically 
-similar but irrelevant. For example: 
-● A user who likes "museums" might get negative samples like "art galleries" 
-(semantically related but not preferred). 
-● Impact : Forces the model to learn subtle distinctions between similar venues. 
+Two data-leakage audits underpin these numbers: one of the prior work's
+classifier, and one of this project's own graph encoder (which had propagated
+over held-out interactions). Both corrections lowered reported figures and are
+documented rather than absorbed.
 
-C. Uncertainty Estimation 
-● Current Approach : BERT and GNN models output deterministic predictions. 
-● Enhancement : 
-○ Add uncertainty estimation layers (e.g., Bayesian neural networks or Monte 
-Carlo dropout) to quantify confidence in recommendations. 
-○ Use this uncertainty to diversify recommendations (e.g., include 
-lower-confidence options to avoid over-reliance on top predictions). 
-○ Example: A recommendation list might include both high-confidence (e.g., 
-"Eiffel Tower") and mid-confidence (e.g., "hidden Parisian café") options.
+## Architecture
 
+```
+BERT-MBTI classifier (4 binary heads, class-weighted loss, user-disjoint split)
+    |
+    +-- BERTopic on MBTI CLS embeddings -> PCA-64 content vectors
+    +-- per-user personality embeddings + visitor-mean venue profiles
+    |
+Heterogeneous GraphSAGE (1 layer, BPR + temperature 0.1 + hard negatives)
+    |
+Reciprocal Rank Fusion (k=60) + post-fusion popularity tie-breaker (alpha=0.01)
+```
 
-Methodology Overview: Illuminating the Multimodal Path to Personalized Recommendations
+Venue personality is the mean personality of a venue's visitors, not the
+embedding of its review text (review-text venue embeddings are near-identical,
+pairwise cosine std ~0.04, and rank close to random).
 
-1. The Big Picture: From Raw Data to Personalized Insights
+## Repository layout
 
-The journey from raw digital noise to a "magical" user recommendation is a multi-stage pipeline designed to transform unstructured interactions into structured intelligence. Our foundation is the Yelp Dataset, comprising four critical sub-datasets: Business (metadata and attributes), Review (textual feedback), User (behavioral history), and Image (visual context).
+- `src/` - models (BERT-MBTI, BERTopic, hetero-GNN, hybrid), planner, explain
+- `scripts/` - training, evaluation, asset building, figure generation
+- `demo/` - Streamlit demo (existing-user, cold-start, and itinerary modes)
+- `hpc/` - SLURM scripts for the faculty HPC cluster
+- `notebooks/` - exploration and an editable thesis-figure notebook
 
-To achieve state-of-the-art precision, our architecture converges these inputs into a Hybrid Recommendation Model through three specific mechanisms:
+Data, trained models, and results are not tracked (they are large and, for the
+thesis, kept private). A fresh clone contains code only.
 
-* Psychographic Feature Extraction: BERT-based classifiers process the Review dataset to extract MBTI personality traits, providing a "Who" for the model.
-* Thematic Semantic Synthesis: Multimodal BERTopic blends Review text and Image embeddings to define the "What" of a venue.
-* Relational Graph Mapping: Interaction history and metadata from the User and Business datasets are transformed into nodes and edges, forming a heterogeneous graph that encodes hidden patterns of preference.
+## Setup
 
-Transitional Insight: Before a recommendation can be made, the system must first decode the "who" (the user’s psyche) and the "what" (the venue’s identity) through deep learning.
+```bash
+python -m venv venv && venv/Scripts/activate   # Windows; use bin/activate on Linux
+pip install -r requirements.txt                # keep numpy==1.26.4
+export NUMBA_DISABLE_INTEL_SVML=1              # required for UMAP
+```
 
+NumPy must stay at 1.26.4; version 2.x breaks numba, UMAP, and the topic
+pipeline. Verify with `python -c "import numpy; print(numpy.__version__)"`.
 
---------------------------------------------------------------------------------
+## Commands
 
+```bash
+# Train the MBTI classifier
+python scripts/train_mbti.py --epochs 4 [--seed N]
 
-2. Phase I: Decoding the User—BERT for MBTI Personality Prediction
+# Rebuild the full downstream pipeline (topics -> GNN -> fusion -> robustness)
+python scripts/rebuild_pipeline.py --seeds 42,123,7,2024,99
 
-To move beyond simple 1–5 star ratings, we utilize a BERT classifier (Bidirectional Encoder Representations from Transformers) to predict a user's Myers-Briggs Type Indicator (MBTI). This allows the system to understand the psychological drivers behind a review.
+# Recommender evaluation (paired, honest GNN split) and 5-seed robustness
+python scripts/evaluate_hybrid.py
+python scripts/robustness_eval.py --seeds 42,123,7,2024,99
 
-The BERT Classification Process
+# Interactive demo (build assets once, then run)
+python scripts/build_demo_assets.py && python scripts/build_planner_assets.py
+streamlit run demo/app.py
 
-Component	Description
-Input	User reviews from the Yelp Review dataset, truncated to a 512-token limit to meet Transformer engineering constraints.
-Mechanism	A multi-layer Transformer architecture featuring bidirectional training, allowing the model to capture context-aware linguistic nuances from both directions simultaneously.
-Output	Classification into one of 16 MBTI types (e.g., INTJ or ENFJ), creating a stable behavioral blueprint for the user.
+# Explainable itinerary proof of concept
+python scripts/run_itineraries.py
+python scripts/eval_planning.py
+python scripts/eval_faithfulness.py
+```
 
-The "So What?" Factor: Traditional rating systems are subjective and "noisy." By predicting personality, we gain a stable profile. For instance, an INFJ might prefer a quiet, library-style cafe. The system can suggest such venues even if the user has never visited one, simply because they align with the user's fundamental nature.
+The graph encoder trains message passing on training edges only and saves its
+split, which `evaluate_hybrid.py` reuses so that every evaluated edge is one the
+encoder never propagated over.
 
-Transitional Insight: Once we understand the user’s personality, we must map it to the venues they visit by exploring the underlying themes of those locations.
+## Acknowledgements
 
-
---------------------------------------------------------------------------------
-
-
-3. Phase II: Mapping the Venue—Multimodal BERTopic Modeling
-
-To understand a venue’s "vibe," the system employs BERTopic. Unlike traditional Latent Dirichlet Allocation (LDA), which treats words as bags of tokens, BERTopic uses transformer-based embeddings to maintain semantic context.
-
-The Multimodal Pipeline
-
-1. Multimodal Input: The system synthesizes textual reviews with visual data. We utilize the CLIP model to generate image embeddings, allowing the architecture to "see" the venue’s atmosphere alongside the text.
-2. Dimensionality Reduction: High-dimensional embeddings are processed via UMAP, compressing the data while preserving essential relational structures between venue features.
-3. Clustering & Geospatial Mapping: The system applies K-Means to identify semantic groups (topics). Crucially, we use HDBSCAN separately for geospatial data, encoding coordinates as vectors to cluster venues into distinct regions (e.g., "Central Paris" or "The Strip").
-4. Thematic Output: The pipeline generates context-aware topics such as "modern architecture" or "vegan-friendly vibes."
-
-The "So What?" Factor: Text often captures functional details (the food), but images capture the aesthetic (the lighting, the seating). Multimodal synthesis provides a "richer understanding" that is critical for matching a venue’s aesthetic to a user’s personality.
-
-Transitional Insight: These individual insights—personality and topics—are then woven together into a complex web of relationships.
-
-
---------------------------------------------------------------------------------
-
-
-4. Phase III: The Architecture of Connection—Graph Construction and GNNs
-
-The data is transformed into a heterogeneous Graph Structure to capture collaborative signals.
-
-* Nodes: These include Users (tagged with MBTI), Venues (tagged with topics), and Context (Time, Weather, and Location).
-* Edges: We define specific relationship types: User-Venue edges weighted by visit frequency/ratings; Venue-Topic edges for association strength; and Venue-Context edges to represent seasonal relevance (e.g., a "rooftop bar" node connected to a "Summer" context node).
-
-The Linear-Time GNN (LTGNN)
-
-To handle millions of interactions across the Yelp dataset, we implement the Linear-Time Graph Neural Network (LTGNN):
-
-* Fixed-Point Iteration: Unlike traditional GNNs that stack multiple layers (causing "over-smoothing"), LTGNN uses a single propagation layer. It captures multi-hop info through information accumulation across training iterations using a fixed-point equation.
-* EVR Sampling: We design an improved variance-reduced neighbor sampling strategy. This reduces the neighbor size during embedding aggregation, allowing the model to scale to massive graphs without sacrificing accuracy.
-* Efficiency: This architecture ensures that computational complexity remains linear to the number of edges, making it viable for industrial-scale deployment.
-
-Transitional Insight: The final step is turning this connected data into a prioritized, highly accurate recommendation list.
-
-
---------------------------------------------------------------------------------
-
-
-5. Phase IV: The Hybrid Engine—Synthesis, Optimization, and Evaluation
-
-The final engine combines the relational intelligence of the GNN with the classification power of XGBoost.
-
-* DCI Closed Algorithm: This algorithm mines frequent closed itemsets from a user's history—sets where no superset has the same support. This creates compact user profiles that eliminate redundancy while preserving every meaningful behavioral pattern.
-* XGBoost Refinement: We use XGBoost to synthesize GNN embeddings with specific context features (e.g., current weather) and personality traits to fine-tune the final suggestion.
-* Overconfidence Mitigation (gBCE Loss): To prevent the model from suggesting only "popular" items, we replace standard loss with gBCE loss. We utilize a calibration parameter t (e.g., t=0.8) to balance the model’s confidence, ensuring that its predicted probability of a "match" aligns with actual user satisfaction.
-
-Transitional Insight: This entire methodology transforms raw, noisy Yelp data into a curated, trustworthy user experience.
-
-
---------------------------------------------------------------------------------
-
-
-6. Conclusion: The Learner’s Takeaway
-
-As an AI architect, your success hinges on three pillars:
-
-1. Multimodal Integration: Language (BERT) and vision (CLIP) must be treated as a single, unified signal to capture the true essence of a venue.
-2. Algorithmic Efficiency: The Linear-Time GNN demonstrates that "deeper" is not always better. Mastering iteration-based information accumulation and variance-reduced sampling is key to scaling.
-3. Human-Centric Modeling: Incorporating MBTI ensures your recommendations feel personal rather than purely transactional.
-
-Modular AI architectures are the industry standard for a reason. By decoupling NLU, Graph, and Hybrid modules, development teams can achieve 25% faster progress through parallel development. This modularity allows you to upgrade your "Brain" (the NLU engine) or "Memory" (the GNN) independently, ensuring your system remains maintainable as it scales to millions of users.
-s
+Supervisor: dr inz. Robert Bembenik. Built on and correcting an earlier MSc
+thesis (Amac, 2024) on the same task.
