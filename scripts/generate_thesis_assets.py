@@ -49,6 +49,7 @@ DATASET = {
 CLF_DIMS = ["E/I", "S/N", "T/F", "J/P"]
 CLF_BEFORE_BAL = [0.579, 0.585, 0.629, 0.565]      # old, leaky split
 CLF_AFTER_BAL = [0.696, 0.782, 0.836, 0.693]       # new, user-disjoint
+CLF_DELEAKED_BAL = [0.582, 0.696, 0.773, 0.599]    # user-disjoint + label terms removed
 CLF_AFTER_ACC = [0.826, 0.813, 0.834, 0.730]       # per-user accuracy
 CLF_SUMMARY = {"mean_acc": 0.801, "mean_bal": 0.752, "exact16": 0.445}
 
@@ -82,7 +83,9 @@ def latex_main_table(agg, k=10):
     lines = [
         "\\begin{table}[t]", "\\centering",
         f"\\caption{{Recommendation performance at $K={k}$ "
-        "(mean $\\pm$ std over 5 seeds). Best per column in \\textbf{bold}.}",
+        "(mean $\\pm$ std over 5 seeds). Best per column in \\textbf{bold}. "
+        "MRR is computed over the full ranked list, not truncated at $K$, so "
+        "its value is identical across the $K$ tables.}",
         f"\\label{{tab:main-results-k{k}}}",
         "\\resizebox{\\textwidth}{!}{%",
         "\\begin{tabular}{lccccc}", "\\toprule",
@@ -108,8 +111,12 @@ def latex_classifier_table():
         "\\begin{table}[t]", "\\centering",
         "\\caption{MBTI classifier per-dimension balanced accuracy before "
         "(post-level split, leaky) and after (user-disjoint split, "
-        "class-weighted, per-user). Only T/F was genuinely learned before; "
-        "all four axes are learned after.}",
+        "class-weighted, per-user). The before and after columns change both "
+        "the split and the aggregation unit together, because these were the "
+        "joint features of the flawed protocol, so the difference is the "
+        "combined effect of correcting both rather than of a single variable. "
+        "Only T/F was genuinely learned before; all four axes are learned "
+        "after.}",
         "\\label{tab:classifier}",
         "\\begin{tabular}{lccc}", "\\toprule",
         "Dimension & Bal. acc.\\ (before) & Bal. acc.\\ (after) "
@@ -145,22 +152,22 @@ def latex_methodology_table():
     rows = [
         ("MBTI classifier", "BERT, 16-class", "BERT, 4 binary heads"),
         ("MBTI evaluation", "Upsample before split (\\textasciitilde94\\%, leaked)",
-         "User-disjoint + class weights (80.1\\%/75.2\\%, honest)"),
+         "User-disjoint + class weights (80.1\\%/75.2\\%, corrected)"),
         ("Topic embeddings", "Generic sentence-transformer",
          "BERT-MBTI CLS (personality-informed)"),
         ("Graph model", "None", "Heterogeneous GNN (GraphSAGE + BPR)"),
         ("Personality in ranking", "Feature in XGBoost",
          "Direct ranker (visitor-mean profiles)"),
-        ("Final ranker", "XGBoost", "Parameter-free RRF (4 signals)"),
+        ("Final ranker", "XGBoost", "Non-learned RRF (4 signals)"),
         ("Ranking metrics", "Not reported", "Full ablation, 5 seeds"),
     ]
     lines = [
         "\\begin{table}[t]", "\\centering",
         "\\caption{Methodology comparison with the prior approach "
-        "(Omer, 2024).}", "\\label{tab:methodology}",
+        "(Amac, 2024).}", "\\label{tab:methodology}",
         "\\resizebox{\\textwidth}{!}{%",
         "\\begin{tabular}{lll}", "\\toprule",
-        "Aspect & Omer (2024) & This thesis \\\\", "\\midrule",
+        "Aspect & Amac (2024) & This thesis \\\\", "\\midrule",
     ]
     for a, o, c in rows:
         lines.append(f"{a} & {o} & {c} \\\\")
@@ -171,17 +178,19 @@ def latex_methodology_table():
 # ---- Figures -----------------------------------------------------------
 def fig_classifier(agg=None):
     x = np.arange(len(CLF_DIMS))
-    w = 0.38
-    fig, ax = plt.subplots(figsize=(7.5, 4.2))
-    ax.bar(x - w/2, CLF_BEFORE_BAL, w, label="Before (leaky split)", color=BAD)
-    ax.bar(x + w/2, CLF_AFTER_BAL, w, label="After (honest, fixed)", color=GOOD)
+    w = 0.27
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
+    ax.bar(x - w, CLF_BEFORE_BAL, w, label="Leaky post-level split", color=BAD)
+    ax.bar(x, CLF_AFTER_BAL, w, label="User-disjoint split", color=GOOD)
+    ax.bar(x + w, CLF_DELEAKED_BAL, w,
+           label="User-disjoint, label terms removed", color=ACC)
     ax.axhline(0.5, ls="--", lw=1.8, color=NEUT, label="Random baseline (0.5)")
     ax.set_xticks(x)
     ax.set_xticklabels(CLF_DIMS)
     ax.set_xlabel("MBTI dimension")
     ax.set_ylabel("Balanced accuracy")
     ax.set_ylim(0, 1.0)
-    ax.legend(frameon=False, loc="upper left")
+    ax.legend(frameon=False, loc="upper left", ncol=2)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     fig.tight_layout()
@@ -260,6 +269,23 @@ def main():
     ])
     (OUT / "tables.tex").write_text(tex, encoding="utf-8")
     print(f"Wrote {OUT/'tables.tex'}")
+
+    # Also emit each table as its own file, so chapters can \input a table at
+    # its point of discussion rather than dumping all of them in one place
+    # (keeps table numbers in the chapter that discusses them).
+    header = ("% Auto-generated by scripts/generate_thesis_assets.py "
+              "- do not edit by hand.\n")
+    individual = {
+        "tab_dataset.tex": latex_dataset_table(),
+        "tab_classifier.tex": latex_classifier_table(),
+        "tab_methodology.tex": latex_methodology_table(),
+        "tab_main_k10.tex": latex_main_table(agg, k=10),
+        "tab_main_k5.tex": latex_main_table(agg, k=5),
+        "tab_main_k20.tex": latex_main_table(agg, k=20),
+    }
+    for name, body in individual.items():
+        (OUT / name).write_text(header + body + "\n", encoding="utf-8")
+    print(f"Wrote {len(individual)} individual table files to {OUT}/")
 
     fig_classifier()
     fig_recommender(agg, k=10)

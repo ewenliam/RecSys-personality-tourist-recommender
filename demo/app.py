@@ -2,10 +2,11 @@
 """
 Streamlit demo for the personality-aware tourist venue recommender.
 
-Serves the exact final system from the thesis: Reciprocal Rank Fusion of four
-signals (content KNN, collaborative GNN, MBTI personality, popularity
-tie-breaker) over precomputed embeddings. No model in the serving path except
-optional live BERT-MBTI inference for the cold-start ("new user") mode.
+Serves the exact final system from the thesis: non-learned Reciprocal Rank
+Fusion of four signals (content KNN, collaborative GNN, MBTI personality, and a
+small popularity weighting) over precomputed embeddings. No model in the serving
+path except optional live BERT-MBTI inference for the cold-start ("new user")
+mode.
 
 Prerequisite:  python scripts/build_demo_assets.py
 Run:           streamlit run demo/app.py
@@ -179,10 +180,16 @@ st.set_page_config(page_title="Personality-aware venue recommender",
                    layout="wide")
 st.title("Personality-aware tourist venue recommender")
 st.caption(
-    "Reciprocal Rank Fusion of four signals: content (BERTopic), "
+    "Non-learned Reciprocal Rank Fusion of four signals: content (BERTopic), "
     "collaborative (GraphSAGE), personality (BERT-MBTI, visitor-mean venue "
-    "profiles), and a popularity tie-breaker. Serving path: cosine "
+    "profiles), and a small popularity weighting. Serving path: cosine "
     "similarities + rank merge over precomputed embeddings."
+)
+st.caption(
+    "Research prototype. The thesis evaluation found the recommendation gain "
+    "traces to generic review-text similarity rather than to MBTI traits, and "
+    "that a popularity baseline is strong (stronger within a single city), so "
+    "this demo illustrates the mechanism rather than a proven improvement."
 )
 
 if not DEMO_DIR.exists():
@@ -200,7 +207,7 @@ with st.sidebar:
     use_content = st.checkbox("Content (BERTopic KNN)", value=True)
     use_gnn = st.checkbox("Collaborative (GNN)", value=True)
     use_mbti = st.checkbox("Personality (MBTI)", value=True)
-    use_pop = st.checkbox("Popularity tie-breaker (alpha=0.01)", value=True)
+    use_pop = st.checkbox("Popularity weighting (alpha=0.01)", value=True)
     pop_alpha = 0.01 if use_pop else 0.0
 
 # ---------------------------------------------------------------- existing --
@@ -256,8 +263,11 @@ elif mode == "New user (cold start)":
     st.subheader("New user: personality from text")
     st.write(
         "Paste a few sentences the user has written (reviews, posts). The "
-        "BERT-MBTI classifier infers a personality profile, which drives "
-        "recommendations even with **zero interaction history**."
+        "BERT-MBTI classifier infers a personality profile, which lets the "
+        "system produce a ranking from text alone, with **zero interaction "
+        "history**. This shows the cold-start mechanism. Note the thesis found "
+        "this pathway does not beat a popularity baseline for thin-history "
+        "users, so it is a capability demonstration, not a measured gain."
     )
     text = st.text_area("User text", height=160, placeholder=(
         "e.g. I usually avoid crowded places - give me a quiet coffee shop "
@@ -297,9 +307,11 @@ elif mode == "New user (cold start)":
             st.subheader("Recommendations (personality + popularity only)")
             st.dataframe(rec_table(assets, top, per_ranks), hide_index=True)
             st.caption(
-                "Content and collaborative signals need interaction history; "
-                "for a brand-new user the personality pathway alone already "
-                "produces a personalised ranking - the cold-start argument."
+                "Content and collaborative signals need interaction history. "
+                "For a brand-new user the personality pathway alone still "
+                "produces a ranking from text, which is the cold-start "
+                "mechanism. A control in the thesis shows the ranking follows "
+                "generic review-text similarity rather than the MBTI traits."
             )
 
 # ---------------------------------------------------------------- plan day --

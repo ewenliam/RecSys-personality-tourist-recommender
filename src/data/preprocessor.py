@@ -28,16 +28,50 @@ class TextPreprocessor:
     WHITESPACE_PATTERN = re.compile(r"\s+")
     SPECIAL_CHAR_PATTERN = re.compile(r"[^\w\s.,!?;:'\"-]")
 
-    def __init__(self, lowercase: bool = True, remove_urls: bool = True):
+    # --- MBTI label-leakage patterns (used only when remove_mbti_terms=True) ---
+    # An audit of the Kaggle corpus found 87% of users write their own type in
+    # their posts, so a classifier can partly recognise the label instead of
+    # inferring personality.  These patterns strip the explicit label terms.
+    # The 16 four-letter type codes (INFP, ENTJ, ...), optionally pluralised.
+    _MBTI_TYPES = [a + b + c + d
+                   for a in "IE" for b in "NS" for c in "TF" for d in "JP"]
+    MBTI_TYPE_PATTERN = re.compile(
+        r"\b(" + "|".join(_MBTI_TYPES) + r")s?\b", re.IGNORECASE)
+    # Axis pair codes written with a slash (E/I, S/N, T/F, J/P, either order).
+    MBTI_PAIR_PATTERN = re.compile(
+        r"\b([EI]/[EI]|[NS]/[NS]|[TF]/[TF]|[JP]/[JP])\b", re.IGNORECASE)
+    # Generic MBTI vocabulary and platform names.
+    MBTI_GENERIC_PATTERN = re.compile(
+        r"\b(mbti|myers[- ]?briggs|16\s?personalities|personality\s?cafe|typology)\b",
+        re.IGNORECASE)
+    # Aggressive extras: cognitive-function codes (Ni, Fe, ...) written in the
+    # conventional capitalised form, and explicit introvert/extrovert identity
+    # nouns.  Common English words (thinking, feeling, sensing) are deliberately
+    # NOT removed: their natural frequency is legitimate personality signal.
+    MBTI_FUNCTION_PATTERN = re.compile(r"\b([NSTF][ie])\b")
+    MBTI_IDENTITY_PATTERN = re.compile(
+        r"\b(intro|extro|extra)vert(ed|s|sion)?\b|\bambivert(ed|s)?\b",
+        re.IGNORECASE)
+
+    def __init__(self, lowercase: bool = True, remove_urls: bool = True,
+                 remove_mbti_terms: bool = False, mbti_aggressive: bool = False):
         """
         Initialize the preprocessor.
 
         Args:
             lowercase: Convert text to lowercase.
             remove_urls: Remove URLs from text.
+            remove_mbti_terms: Strip explicit MBTI label terms (type codes,
+                axis pair codes, and generic MBTI vocabulary) so the classifier
+                cannot read the target label off the text.  Use for the MBTI
+                classifier's own training text, not for Yelp reviews.
+            mbti_aggressive: Additionally strip cognitive-function codes and
+                introvert/extrovert identity nouns.
         """
         self.lowercase = lowercase
         self.remove_urls = remove_urls
+        self.remove_mbti_terms = remove_mbti_terms
+        self.mbti_aggressive = mbti_aggressive
 
     def clean_text(self, text: str) -> str:
         """
@@ -65,6 +99,16 @@ class TextPreprocessor:
 
         # Remove emails
         text = self.EMAIL_PATTERN.sub(" ", text)
+
+        # Remove explicit MBTI label terms (before special-char removal, so the
+        # slash in pair codes like "E/I" is still intact, and before lowercasing).
+        if self.remove_mbti_terms:
+            text = self.MBTI_TYPE_PATTERN.sub(" ", text)
+            text = self.MBTI_PAIR_PATTERN.sub(" ", text)
+            text = self.MBTI_GENERIC_PATTERN.sub(" ", text)
+            if self.mbti_aggressive:
+                text = self.MBTI_FUNCTION_PATTERN.sub(" ", text)
+                text = self.MBTI_IDENTITY_PATTERN.sub(" ", text)
 
         # Remove special characters (keep basic punctuation)
         text = self.SPECIAL_CHAR_PATTERN.sub(" ", text)

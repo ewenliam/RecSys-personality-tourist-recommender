@@ -63,8 +63,17 @@ def load_raw_users() -> pd.DataFrame:
     return df
 
 
-def explode_and_clean(users_df: pd.DataFrame) -> pd.DataFrame:
-    """Explode each user's '|||'-separated posts into rows and clean text."""
+def explode_and_clean(
+    users_df: pd.DataFrame,
+    strip_mbti_terms: bool = False,
+    mbti_aggressive: bool = False,
+) -> pd.DataFrame:
+    """Explode each user's '|||'-separated posts into rows and clean text.
+
+    When strip_mbti_terms is True, explicit MBTI label terms are removed from
+    the text (see TextPreprocessor) so the classifier cannot recognise the
+    target label instead of inferring personality from writing style.
+    """
     rows = []
     for _, row in users_df.iterrows():
         uid = int(row["user_id"])
@@ -74,7 +83,8 @@ def explode_and_clean(users_df: pd.DataFrame) -> pd.DataFrame:
             if post:
                 rows.append({"user_id": uid, "mbti": mbti_type, "text": post})
     exploded = pd.DataFrame(rows)
-    preprocessor = TextPreprocessor()
+    preprocessor = TextPreprocessor(
+        remove_mbti_terms=strip_mbti_terms, mbti_aggressive=mbti_aggressive)
     exploded = preprocessor.process_dataframe(exploded, text_column="text")
     return exploded
 
@@ -133,6 +143,8 @@ def split_users_and_explode(
     val_ratio: float = 0.5,
     upsample: bool = False,
     seed: int = 42,
+    strip_mbti_terms: bool = False,
+    mbti_aggressive: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     USER-LEVEL split, then explode posts within each split.
@@ -161,9 +173,9 @@ def split_users_and_explode(
         f"test={len(test_u)} users (disjoint)"
     )
 
-    train_df = explode_and_clean(train_u)
-    val_df = explode_and_clean(val_u)
-    test_df = explode_and_clean(test_u)
+    train_df = explode_and_clean(train_u, strip_mbti_terms, mbti_aggressive)
+    val_df = explode_and_clean(val_u, strip_mbti_terms, mbti_aggressive)
+    test_df = explode_and_clean(test_u, strip_mbti_terms, mbti_aggressive)
     logger.info(
         f"After exploding posts: train={len(train_df)} val={len(val_df)} "
         f"test={len(test_df)} posts"
@@ -275,7 +287,12 @@ def main(args):
     use_class_weights = getattr(config.bert, "use_class_weights", True)
     use_upsample = config.data.upsample_minority and not use_class_weights
     train_df, val_df, test_df = split_users_and_explode(
-        users_df, upsample=use_upsample, seed=config.data.random_seed)
+        users_df, upsample=use_upsample, seed=config.data.random_seed,
+        strip_mbti_terms=args.strip_mbti_terms,
+        mbti_aggressive=args.strip_mbti_aggressive)
+    if args.strip_mbti_terms:
+        logger.info("MBTI label terms STRIPPED from text "
+                    f"(aggressive={args.strip_mbti_aggressive})")
 
     # Determine text column
     text_col = "clean_text" if "clean_text" in train_df.columns else "text"
@@ -318,6 +335,13 @@ def main(args):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model parameters: {num_params:,}")
 
+    # Route checkpoints to a run-specific directory so a de-leaked retrain
+    # never overwrites the canonical bert_mbti checkpoints.
+    run_name = args.run_name or (
+        "bert_mbti_deleaked" if args.strip_mbti_terms else "bert_mbti")
+    ckpt_dir = CHECKPOINT_DIR / run_name
+    logger.info(f"Checkpoints will be written to: {ckpt_dir}")
+
     # Create trainer
     trainer = MBTITrainer(
         model=model,
@@ -325,6 +349,7 @@ def main(args):
         val_loader=val_loader,
         config=config.bert,
         device=device,
+        checkpoint_dir=ckpt_dir,
     )
 
     # Resume from checkpoint if specified
@@ -350,7 +375,7 @@ def main(args):
 
     # Honest final evaluation: load the best checkpoint and score the
     # held-out TEST users with per-user majority vote (no leakage).
-    best_path = CHECKPOINT_DIR / "bert_mbti" / "best_model.pt"
+    best_path = ckpt_dir / "best_model.pt"
     if best_path.exists():
         ck = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(ck.get("model_state_dict", ck))
@@ -386,6 +411,23 @@ if __name__ == "__main__":
         "--seed", type=int, default=None,
         help="Random seed controlling the user split AND init "
              "(for multi-seed robustness runs)",
+    )
+    parser.add_argument(
+        "--strip-mbti-terms", action="store_true",
+        help="Remove explicit MBTI label terms (type codes, axis pair codes, "
+             "generic MBTI vocabulary) from the training text to test whether "
+             "accuracy depends on label leakage. Writes to a separate "
+             "bert_mbti_deleaked checkpoint dir by default.",
+    )
+    parser.add_argument(
+        "--strip-mbti-aggressive", action="store_true",
+        help="With --strip-mbti-terms, also remove cognitive-function codes "
+             "(Ni, Fe, ...) and introvert/extrovert identity nouns.",
+    )
+    parser.add_argument(
+        "--run-name", type=str, default=None,
+        help="Checkpoint sub-directory name under models/checkpoints/ "
+             "(defaults to bert_mbti, or bert_mbti_deleaked with --strip-mbti-terms).",
     )
 
     args = parser.parse_args()

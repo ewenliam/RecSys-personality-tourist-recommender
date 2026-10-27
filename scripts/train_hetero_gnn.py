@@ -241,6 +241,18 @@ def main(args):
     embeddings = load_embeddings(MODEL_DIR)
     interactions, user_col, biz_col, rating_col = load_interactions(PROCESSED_DATA_DIR)
 
+    # B1 positive-interaction threshold: keep only edges rated >= theta as
+    # positive interactions, for both training and evaluation.
+    if getattr(args, "rating_threshold", 1) and args.rating_threshold > 1:
+        if rating_col is None:
+            raise ValueError("No rating column found but --rating-threshold requested.")
+        before = len(interactions)
+        interactions = interactions[interactions[rating_col] >= args.rating_threshold]
+        logger.info(
+            f"Rating threshold >= {args.rating_threshold}: kept "
+            f"{len(interactions):,} of {before:,} interactions"
+        )
+
     # Build graph
     logger.info("Building heterogeneous graph...")
     builder, mappings = build_graph(interactions, user_col, biz_col, rating_col, embeddings)
@@ -278,7 +290,8 @@ def main(args):
 
     # Persist the split so scripts/evaluate_hybrid.py can evaluate on exactly
     # the edges this model never saw, in the same (GNN) index space.
-    split_path = MODEL_DIR / "gnn_hetero" / "split_edges.npz"
+    out_subdir = getattr(args, "out_subdir", None) or "gnn_hetero"
+    split_path = MODEL_DIR / out_subdir / "split_edges.npz"
     split_path.parent.mkdir(parents=True, exist_ok=True)
     eval_edges = torch.cat([val_edges, test_edges], dim=1)
     np.savez(
@@ -346,7 +359,7 @@ def main(args):
     logger.info("Extracting learned embeddings...")
     learned_embs = trainer.get_embeddings()
 
-    save_dir = MODEL_DIR / "gnn_hetero"
+    save_dir = MODEL_DIR / out_subdir
     save_dir.mkdir(parents=True, exist_ok=True)
 
     for node_type, emb in learned_embs.items():
@@ -396,6 +409,12 @@ if __name__ == "__main__":
     parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu", "mps"])
     parser.add_argument("--quick", action="store_true", help="Quick run with reduced epochs")
+    parser.add_argument("--rating-threshold", type=int, default=1,
+                        help="Keep only interactions rated >= this as positive "
+                             "(B1 sensitivity, default 1 = all reviews).")
+    parser.add_argument("--out-subdir", type=str, default="gnn_hetero",
+                        help="Output subdir under models/ (use e.g. gnn_hetero_t4 "
+                             "for a threshold rebuild so the canonical graph is kept).")
 
     args = parser.parse_args()
     main(args)

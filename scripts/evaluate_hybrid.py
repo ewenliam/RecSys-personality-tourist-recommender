@@ -166,6 +166,7 @@ class RRFRanker:
         venue_extra: Optional[np.ndarray] = None,  # BERTopic PCA [n_v, d]
         user_mbti: Optional[np.ndarray] = None,    # BERT-MBTI user CLS [n_u, 768]
         venue_mbti: Optional[np.ndarray] = None,   # BERT-MBTI venue CLS [n_v, 768]
+        candidate_mask: Optional[np.ndarray] = None,  # bool [n_v]; keep True only
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Return the top-k recommended venues for user_idx using RRF.
@@ -226,6 +227,10 @@ class RRFRanker:
         # ---- Popularity tie-breaker (epsilon scale) --------------------
         if self.popularity_alpha > 0 and self.venue_log_degree is not None:
             rrf_score *= (1.0 + self.popularity_alpha * self.venue_log_degree)
+
+        # ---- Restrict to a candidate subset (e.g. one destination city) -
+        if candidate_mask is not None:
+            rrf_score[~candidate_mask] = -np.inf
 
         # ---- Exclude already-visited venues ----------------------------
         if exclude_venues:
@@ -356,9 +361,12 @@ class PopularityRanker:
         exclude_venues: Optional[set] = None,
         user_extra: Optional[np.ndarray] = None,
         venue_extra: Optional[np.ndarray] = None,
+        candidate_mask: Optional[np.ndarray] = None,
         **kwargs,  # absorb user_mbti/venue_mbti (unused by popularity)
     ) -> tuple[np.ndarray, np.ndarray]:
         scores = self.venue_log_degree.copy()
+        if candidate_mask is not None:
+            scores[~candidate_mask] = -np.inf
         if exclude_venues:
             for vid in exclude_venues:
                 if 0 <= vid < len(scores):
@@ -391,9 +399,9 @@ def run_popularity_evaluation(
     return metrics, ranker
 
 
-def load_gnn_embeddings(model_dir: Path) -> dict:
+def load_gnn_embeddings(model_dir: Path, subdir: str = "gnn_hetero") -> dict:
     """Load GNN-learned embeddings from Phase 3."""
-    emb_dir = model_dir / "gnn_hetero"
+    emb_dir = model_dir / subdir
     embeddings = {}
 
     for node_type in ["user", "venue"]:
@@ -511,7 +519,9 @@ def _user_gt_from(test_edges: np.ndarray) -> dict:
     return user_gt
 
 
-def load_gnn_split(model_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
+def load_gnn_split(
+    model_dir: Path, subdir: str = "gnn_hetero", portion: str = "both"
+) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Load the exact split the GNN was trained with.
 
@@ -519,8 +529,17 @@ def load_gnn_split(model_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
     the edges it never saw is what makes the collaborative signal honest.
     Both arrays are already in the GNN index space, which is the same space
     used everywhere downstream (see id_mappings.pt).
+
+    The saved ``eval_edges`` is ``concat([val, test])`` from the 80/10/10
+    split in train_hetero_gnn.py, val first. The encoder's checkpoint was
+    selected on the val portion, so ``portion="test"`` returns just the test
+    tail (the last 10%% of all edges), which no part of training or model
+    selection ever touched, ``portion="val"`` returns just the val head (a
+    diagnostic for how much checkpoint selection inflates that portion), and
+    ``portion="both"`` (default) returns the full 20%% as reported in the
+    thesis.
     """
-    path = model_dir / "gnn_hetero" / "split_edges.npz"
+    path = model_dir / subdir / "split_edges.npz"
     if not path.exists():
         raise FileNotFoundError(
             f"{path} not found. Retrain the graph encoder "
@@ -528,10 +547,21 @@ def load_gnn_split(model_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
             "--split random to reproduce the older, leakage-prone protocol."
         )
     data = np.load(path)
-    train_edges, test_edges = data["train_edges"], data["eval_edges"]
+    train_edges, eval_edges = data["train_edges"], data["eval_edges"]
+    total = train_edges.shape[1] + eval_edges.shape[1]
+    n_val = int(0.1 * total)
+    if portion == "test":
+        test_edges = eval_edges[:, n_val:]
+        note = f"TEST ONLY (val head of {n_val} edges dropped)"
+    elif portion == "val":
+        test_edges = eval_edges[:, :n_val]
+        note = f"VAL ONLY (test tail dropped); diagnostic for selection bias"
+    else:
+        test_edges = eval_edges
+        note = "edges the encoder never propagated over"
     logger.info(
-        f"Loaded GNN split: train={train_edges.shape[1]}, "
-        f"test={test_edges.shape[1]} (edges the encoder never propagated over)"
+        f"Loaded GNN split [{portion}]: train={train_edges.shape[1]}, "
+        f"test={test_edges.shape[1]} ({note})"
     )
     return train_edges, test_edges, _user_gt_from(test_edges)
 
@@ -853,6 +883,218 @@ def generate_methodology_comparison(
     return comparison_df, latex
 
 
+class ItemKNNRanker:
+    """Item-item collaborative filtering: score(u, v) = sum over the venues u
+    visited in training of cosine(item_i, item_v), where item vectors are the
+    columns of the binary user-venue matrix. A classic non-learned baseline."""
+
+    def __init__(self, train_edges, n_users, n_venues):
+        from scipy.sparse import csr_matrix
+        data = np.ones(train_edges.shape[1], dtype=np.float32)
+        self.R = csr_matrix((data, (train_edges[0], train_edges[1])),
+                            shape=(n_users, n_venues))
+        self.Rt = self.R.T.tocsr()
+        deg = np.asarray(self.R.sum(0)).ravel()
+        self.inv_norm = (1.0 / (np.sqrt(deg) + 1e-8)).astype(np.float32)
+        self.n_venues = n_venues
+
+    def recommend(self, user_idx, k=10, exclude_venues=None, **kwargs):
+        from scipy.sparse import csr_matrix
+        items = self.R[user_idx].indices
+        if len(items) == 0:
+            scores = np.zeros(self.n_venues, dtype=np.float32)
+        else:
+            # weighted user row (kept sparse so the products stay sparse)
+            w = csr_matrix((self.inv_norm[items],
+                            (np.zeros(len(items), dtype=np.int64), items)),
+                           shape=(1, self.n_venues))
+            neigh = w @ self.Rt                           # 1 x n_users, sparse
+            scores = np.asarray((neigh @ self.R).todense()).ravel() * self.inv_norm
+        if exclude_venues:
+            for v in exclude_venues:
+                if 0 <= v < len(scores):
+                    scores[v] = -np.inf
+        top = np.argsort(-scores)[:k]
+        return top, scores[top].astype(np.float32)
+
+
+class MFRanker:
+    """Matrix-factorisation ranker: score(u, v) = <user_factor_u, venue_factor_v>."""
+
+    def __init__(self, user_factors, venue_factors):
+        self.U = user_factors
+        self.V = venue_factors
+
+    def recommend(self, user_idx, k=10, exclude_venues=None, **kwargs):
+        scores = self.V @ self.U[user_idx]
+        if exclude_venues:
+            for v in exclude_venues:
+                if 0 <= v < len(scores):
+                    scores[v] = -np.inf
+        top = np.argsort(-scores)[:k]
+        return top, scores[top].astype(np.float32)
+
+
+def train_bpr_mf(train_edges, n_users, n_venues, dim=64, epochs=20,
+                 lr=0.01, batch_size=4096, device="cpu", seed=42):
+    """Train Bayesian Personalized Ranking matrix factorisation on train edges."""
+    import torch
+    torch.manual_seed(seed)
+    U = torch.nn.Embedding(n_users, dim).to(device)
+    V = torch.nn.Embedding(n_venues, dim).to(device)
+    torch.nn.init.normal_(U.weight, std=0.1)
+    torch.nn.init.normal_(V.weight, std=0.1)
+    opt = torch.optim.Adam(list(U.parameters()) + list(V.parameters()),
+                           lr=lr, weight_decay=1e-5)
+    u_arr = torch.tensor(train_edges[0], dtype=torch.long)
+    v_arr = torch.tensor(train_edges[1], dtype=torch.long)
+    E = u_arr.shape[0]
+    for ep in range(epochs):
+        perm = torch.randperm(E)
+        tot = 0.0
+        for i in range(0, E, batch_size):
+            idx = perm[i:i + batch_size]
+            u = u_arr[idx].to(device)
+            vp = v_arr[idx].to(device)
+            vn = torch.randint(0, n_venues, (idx.shape[0],), device=device)
+            xuij = (U(u) * V(vp)).sum(1) - (U(u) * V(vn)).sum(1)
+            loss = -torch.log(torch.sigmoid(xuij) + 1e-8).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+            tot += float(loss)
+        logger.info(f"  BPR-MF epoch {ep + 1}/{epochs} loss {tot / max(1, E // batch_size):.4f}")
+    return MFRanker(U.weight.detach().cpu().numpy(),
+                    V.weight.detach().cpu().numpy())
+
+
+def run_baselines(seed, train_edges, user_gt, eval_users, n_users, n_venues,
+                  k_values, device="cpu"):
+    """Evaluate conventional collaborative baselines (item-kNN, BPR-MF) plus a
+    popularity anchor on the SAME eval users as the main results, and save
+    results/baseline_seed{seed}.csv."""
+    pop = PopularityRanker()
+    pop.set_venue_degree(train_edges, n_venues)
+    logger.info("[baselines] building item-kNN...")
+    iknn = ItemKNNRanker(train_edges, n_users, n_venues)
+    logger.info("[baselines] training BPR-MF...")
+    mf = train_bpr_mf(train_edges, n_users, n_venues, device=device, seed=42)
+
+    dummy_u = np.zeros((n_users, 1), dtype=np.float32)
+    dummy_v = np.zeros((n_venues, 1), dtype=np.float32)
+    frames = []
+    for name, ranker in [("Popularity (anchor)", pop),
+                         ("Item-kNN", iknn), ("BPR-MF", mf)]:
+        m = evaluate_recommendations(ranker, dummy_u, dummy_v, user_gt, k_values,
+                                     eval_users=eval_users)
+        m["Model"] = name
+        frames.append(m)
+    df = pd.concat(frames, ignore_index=True)
+    df["seed"] = seed
+    out = RESULTS_DIR / f"baseline_seed{seed}.csv"
+    df.to_csv(out, index=False)
+    logger.info(f"[baselines] saved {out}")
+    logger.info("\n" + df[df.K == 10][["Model", "NDCG@K", "Hit Rate@K"]].to_string(index=False))
+
+
+def run_extra_analysis(
+    seed, train_edges, user_gt, eval_users, venue_id_map,
+    user_embeddings, venue_embeddings, knn_user_embs, bertopic_venue_embs,
+    user_mbti_embs, venue_mbti_embs, rrf_k=60, pop_alpha=0.01, k=10,
+):
+    """Destination-conditioned and cold-start-stratified evaluation.
+
+    Reuses the exact Full-hybrid ranker, the same eval users, and the same
+    no-exclude convention as the main evaluation, so the numbers line up with
+    the Full and Popularity rows. Per user it records full-catalogue and
+    home-city Full/Popularity metrics plus the training-interaction count.
+    """
+    from collections import Counter
+    n_venues = venue_embeddings.shape[0]
+
+    # Venue -> city code, in GNN venue index space.
+    inv_v = {g: b for b, g in venue_id_map.items()}
+    bdf = pd.read_parquet(PROCESSED_DATA_DIR / "businesses.parquet")[["business_id", "city"]]
+    bcity = dict(zip(bdf["business_id"], bdf["city"]))
+    code = {c: i for i, c in enumerate(sorted(set(bcity.values())))}
+    venue_city = np.full(n_venues, -1, np.int32)
+    for g in range(n_venues):
+        venue_city[g] = code.get(bcity.get(inv_v.get(g)), -1)
+
+    u_tr = {}
+    for i in range(train_edges.shape[1]):
+        u_tr.setdefault(int(train_edges[0, i]), []).append(int(train_edges[1, i]))
+
+    # Held-out star ratings per (user, venue), for the positive-threshold check.
+    gt_stars = {}
+    rp = RESULTS_DIR / "eval_edge_ratings.npz"
+    if rp.exists():
+        rr = np.load(rp)
+        for uu, vv, ss in zip(rr["u_idx"], rr["v_idx"], rr["stars"]):
+            gt_stars.setdefault(int(uu), {})[int(vv)] = float(ss)
+
+    calc = RecommendationMetrics()
+    degree = np.zeros(n_venues, np.float32)
+    np.add.at(degree, train_edges[1], 1)
+    logdeg = np.log1p(degree).astype(np.float32)
+    cos, rank = RRFRanker._cosine_scores, RRFRanker._scores_to_ranks
+    have_mbti = user_mbti_embs is not None and venue_mbti_embs is not None
+
+    def full_arr(u):
+        # Identical to RRFRanker rrf_mode="full": sum of 1/(k+rank) over the
+        # content, graph, and personality sub-rankers, then popularity weight.
+        r = 1.0 / (rrf_k + rank(cos(knn_user_embs[u], bertopic_venue_embs)))
+        r = r + 1.0 / (rrf_k + rank(cos(user_embeddings[u], venue_embeddings)))
+        if have_mbti:
+            r = r + 1.0 / (rrf_k + rank(cos(user_mbti_embs[u], venue_mbti_embs)))
+        return r * (1.0 + pop_alpha * logdeg)
+
+    def topk(arr, gt, mask=None):
+        s = arr if mask is None else np.where(mask, arr, -np.inf)
+        recs = np.argsort(-s)[:k].tolist()
+        return calc.ndcg_at_k(recs, gt, k), calc.hit_rate_at_k(recs, gt, k)
+
+    rows = []
+    for u in eval_users:
+        gt = user_gt.get(u)
+        if not gt:
+            continue
+        tr = u_tr.get(u, [])
+        cs = [venue_city[v] for v in tr if venue_city[v] >= 0]
+        hc = Counter(cs).most_common(1)[0][0] if cs else -1
+        hs = full_arr(u)                       # full-hybrid score array, once
+        fh_n, fh_h = topk(hs, gt)
+        fp_n, fp_h = topk(logdeg, gt)
+        row = dict(seed=seed, u=int(u), tcount=len(tr),
+                   fh_ndcg=fh_n, fh_hr=fh_h, fp_ndcg=fp_n, fp_hr=fp_h,
+                   city_ok=False, ch_ndcg=np.nan, ch_hr=np.nan,
+                   cp_ndcg=np.nan, cp_hr=np.nan)
+        # Positive-interaction threshold: relevant set kept only if rating >= th.
+        gs = gt_stars.get(u, {})
+        for th in (3, 4):
+            gt_hi = {v for v in gt if gs.get(v, 0) >= th}
+            if gt_hi:
+                thn, thh = topk(hs, gt_hi)
+                pthn, pthh = topk(logdeg, gt_hi)
+            else:
+                thn = thh = pthn = pthh = np.nan
+            row[f"t{th}_fh_ndcg"] = thn
+            row[f"t{th}_fh_hr"] = thh
+            row[f"t{th}_fp_ndcg"] = pthn
+            row[f"t{th}_fp_hr"] = pthh
+        if hc >= 0:
+            gt_city = {v for v in gt if venue_city[v] == hc}
+            if gt_city:
+                mask = (venue_city == hc)
+                ch_n, ch_h = topk(hs, gt_city, mask)
+                cp_n, cp_h = topk(logdeg, gt_city, mask)
+                row.update(city_ok=True, ch_ndcg=ch_n, ch_hr=ch_h,
+                           cp_ndcg=cp_n, cp_hr=cp_h)
+        rows.append(row)
+
+    out = RESULTS_DIR / f"extra_seed{seed}.csv"
+    pd.DataFrame(rows).to_csv(out, index=False)
+    logger.info(f"[extra] destination + cold-start rows saved to {out}")
+
+
 def main(args):
     """Run the hybrid evaluation pipeline."""
     setup_logging(level=logging.INFO)
@@ -863,7 +1105,7 @@ def main(args):
 
     # Load data
     logger.info("Loading data...")
-    gnn_embs = load_gnn_embeddings(MODEL_DIR)
+    gnn_embs = load_gnn_embeddings(MODEL_DIR, getattr(args, "gnn_subdir", "gnn_hetero"))
     personality_data = load_personality_data(MODEL_DIR)
     interactions, user_col, biz_col = load_interactions(PROCESSED_DATA_DIR)
 
@@ -984,7 +1226,11 @@ def main(args):
     # split so that every evaluated edge is one the encoder never propagated
     # over. Passing --split random reproduces the older protocol.
     if args.split == "gnn":
-        train_edges, test_edges, user_gt = load_gnn_split(MODEL_DIR)
+        _portion = "test" if getattr(args, "test_only", False) else getattr(args, "eval_portion", "both")
+        train_edges, test_edges, user_gt = load_gnn_split(
+            MODEL_DIR, getattr(args, "gnn_subdir", "gnn_hetero"),
+            portion=_portion,
+        )
     else:
         train_edges, test_edges, user_gt = create_train_test_edges(
             interactions, user_col, biz_col,
@@ -1416,6 +1662,19 @@ def main(args):
         pd.DataFrame(rows).to_csv(sig_out, index=False)
         logger.info(f"Saved paired significance tests to {sig_out}")
 
+    if getattr(args, "extra_analysis", False):
+        run_extra_analysis(
+            args.seed, train_edges, user_gt, eval_users, venue_id_map,
+            user_embeddings, venue_embeddings, knn_user_embs, bertopic_venue_embs,
+            user_mbti_embs, venue_mbti_embs,
+            rrf_k=args.rrf_k, pop_alpha=args.pop_alpha)
+
+    if getattr(args, "baselines", False):
+        from src.utils.helpers import get_device
+        run_baselines(args.seed, train_edges, user_gt, eval_users,
+                      n_users, n_venues, k_values,
+                      device=get_device(getattr(args, "device", "cuda")))
+
     logger.info(f"\nResults saved to {RESULTS_DIR}")
     logger.info("Done.")
 
@@ -1451,9 +1710,42 @@ if __name__ == "__main__":
              "graph. 'random' reproduces the older, leakage-prone protocol.",
     )
     parser.add_argument(
+        "--test-only", action="store_true",
+        help="Shorthand for --eval-portion test.",
+    )
+    parser.add_argument(
+        "--eval-portion", type=str, default="both", choices=["both", "val", "test"],
+        help="Which held-out edges to score under --split gnn. 'both' (default) "
+             "is the val+test 20%% reported in the thesis. 'test' is the clean "
+             "test tail (val head dropped, removes the val-in-eval overlap). "
+             "'val' is the val head alone, a diagnostic for how much checkpoint "
+             "selection inflates the val portion.",
+    )
+    parser.add_argument(
         "--out", type=str, default=None,
         help="Optional path to write the metrics CSV "
              "(default results/phase4_hybrid_metrics.csv)",
+    )
+    parser.add_argument(
+        "--extra-analysis", action="store_true",
+        help="Also run destination-conditioned (home-city) and cold-start-"
+             "stratified evaluation on the same eval users, saving "
+             "results/extra_seed{seed}.csv.",
+    )
+    parser.add_argument(
+        "--gnn-subdir", type=str, default="gnn_hetero",
+        help="models/ subdir holding the GNN split and embeddings to evaluate "
+             "(e.g. gnn_hetero_t4 for a B1 threshold rebuild).",
+    )
+    parser.add_argument(
+        "--baselines", action="store_true",
+        help="Also evaluate conventional collaborative baselines (item-kNN, "
+             "BPR-MF) plus a popularity anchor on the same eval users, saving "
+             "results/baseline_seed{seed}.csv.",
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda", choices=["cuda", "cpu", "mps"],
+        help="Device for BPR-MF training (default cuda, falls back to cpu).",
     )
 
     args = parser.parse_args()
